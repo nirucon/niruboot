@@ -20,7 +20,7 @@
 # Debian live USB. UEFI only. See README.md.
 set -Eeuo pipefail
 
-VERSION=0.1.0
+VERSION=0.1.1
 LOG=/tmp/niruboot.log
 TARGET=${NIRUBOOT_TARGET:-/mnt}
 MAPPER=cryptroot
@@ -425,7 +425,7 @@ install_void() {
   cp -a /var/db/xbps/keys/. "$TARGET/var/db/xbps/keys/"
   local pkgs=(base-system grub-x86_64-efi efibootmgr btrfs-progs cryptsetup dracut NetworkManager
               sudo curl git openssh chrony zramen void-repo-nonfree linux-firmware mesa-dri vulkan-loader
-              dbus bash-completion rsync wget openssl)
+              dbus bash-completion rsync wget openssl xz unzip)
   has_gpu intel && pkgs+=(mesa-vulkan-intel intel-video-accel)
   has_gpu amd && pkgs+=(mesa-vulkan-radeon mesa-vaapi)
   [ "$CPU_VENDOR" = amd ] && pkgs+=(linux-firmware-amd)
@@ -471,14 +471,20 @@ install_void() {
 install_arch() {
   step 'Installing Arch Linux'
   local pkgs=(base linux linux-firmware btrfs-progs cryptsetup grub efibootmgr networkmanager sudo
-              curl git openssh zram-generator mesa vulkan-icd-loader bash-completion rsync wget man-db)
+              curl git openssh zram-generator mesa vulkan-icd-loader bash-completion rsync wget man-db
+              xz unzip)
   [ "$CPU_VENDOR" = intel ] && pkgs+=(intel-ucode)
   [ "$CPU_VENDOR" = amd ] && pkgs+=(amd-ucode)
   has_gpu intel && pkgs+=(vulkan-intel intel-media-driver)
   has_gpu amd && pkgs+=(vulkan-radeon libva-mesa-driver)
   quiet pacman-key --init 2>/dev/null || :
   quiet pacman-key --populate archlinux 2>/dev/null || :
-  quiet pacstrap -K "$TARGET" "${pkgs[@]}"
+  # The live system's pacman.conf, without NoExtract rules (container and
+  # some live images strip documentation and locales); the new system gets a
+  # complete copy of it.
+  grep -v '^[[:space:]]*NoExtract' /etc/pacman.conf > /tmp/niruboot-pacman.conf
+  quiet pacstrap -K -C /tmp/niruboot-pacman.conf "$TARGET" "${pkgs[@]}"
+  [ -s "$TARGET/etc/pacman.conf" ] || install -m 644 /tmp/niruboot-pacman.conf "$TARGET/etc/pacman.conf"
   ok 'base system'
   write_fstab
   bind_mounts
@@ -545,7 +551,7 @@ EOF
   local pkgs=(linux-image-amd64 grub-efi-amd64 efibootmgr btrfs-progs network-manager sudo curl git
               openssh-server console-setup keyboard-configuration firmware-linux systemd-timesyncd
               systemd-zram-generator mesa-vulkan-drivers mesa-va-drivers bash-completion rsync wget
-              man-db dbus initramfs-tools openssl)
+              man-db dbus initramfs-tools openssl xz-utils unzip)
   [ "$ENCRYPT" = yes ] && pkgs+=(cryptsetup cryptsetup-initramfs)
   [ "$CPU_VENDOR" = intel ] && pkgs+=(intel-microcode)
   [ "$CPU_VENDOR" = amd ] && pkgs+=(amd64-microcode)

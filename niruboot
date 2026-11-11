@@ -20,7 +20,7 @@
 # Debian live USB. UEFI only. See README.md.
 set -Eeuo pipefail
 
-VERSION=0.1.1
+VERSION=0.1.2
 LOG=/tmp/niruboot.log
 TARGET=${NIRUBOOT_TARGET:-/mnt}
 MAPPER=cryptroot
@@ -57,6 +57,36 @@ warn() { printf '%s  !%s %s\n' "$Y" "$N" "$*"; printf '  ! %s\n' "$*" >> "$LOG";
 die()  { printf '\n%sniruboot: %s%s\n' "$R" "$*" "$N" >&2; printf 'niruboot: %s\n' "$*" >> "$LOG"; exit 1; }
 # Run a command with its output in the log only.
 quiet() { "$@" >> "$LOG" 2>&1; }
+
+# A slow step: the output goes to the log, and the screen shows a spinner,
+# the time so far and the latest line of the log, so you can see it is
+# working. Without a terminal it prints one line instead.
+long() { # long "what is happening" command...
+  local msg=$1 pid rc=0 t0=$SECONDS i=0 w line spin='|/-'"\\"
+  shift
+  if [ ! -t 1 ]; then printf '  %s...\n' "$msg"; quiet "$@"; return; fi
+  printf '  %s...\n' "$msg" >> "$LOG"
+  ( trap - ERR; "$@" ) >> "$LOG" 2>&1 &
+  pid=$!
+  w=$(( $(tput cols 2>/dev/null || echo 80) - ${#msg} - 18 ))
+  [ "$w" -gt 0 ] || w=0
+  while kill -0 "$pid" 2>/dev/null; do
+    line=$(tail -n 1 "$LOG" 2>/dev/null | tr -cd '[:print:]')
+    line=${line:0:$w}
+    printf '\r\e[K  %s %s (%s) %s' "${spin:i++%4:1}" "$msg" "$(elapsed $((SECONDS - t0)))" "$Y$line$N"
+    sleep 1
+  done
+  wait "$pid" || rc=$?
+  printf '\r\e[K'
+  if [ "$rc" = 0 ]; then
+    printf '  %s done (%s)\n' "$msg" "$(elapsed $((SECONDS - t0)))"
+  else
+    printf '%s  ! %s failed. The last lines of the log:%s\n' "$R" "$msg" "$N"
+    tail -n 8 "$LOG" | sed 's/^/    /'
+  fi
+  return "$rc"
+}
+elapsed() { printf '%d:%02d' $(($1 / 60)) $(($1 % 60)); }
 trap 'printf "\n%sniruboot stopped at line %s. Details: %s%s\n" "$R" "$LINENO" "$LOG" "$N" >&2' ERR
 
 ask() { # ask VAR "Question" default
@@ -118,105 +148,249 @@ live_tools() {
   [ "${#need[@]}" = 0 ] && return 0
   step "Adding tools to the live system: ${need[*]}"
   case "$DISTRO" in
-    void) quiet xbps-install -Syu xbps && quiet xbps-install -Sy dosfstools e2fsprogs btrfs-progs cryptsetup curl util-linux ;;
-    arch) quiet pacman -Sy --noconfirm --needed dosfstools e2fsprogs btrfs-progs cryptsetup curl ;;
-    debian) quiet apt-get update && quiet apt-get install -y debootstrap dosfstools e2fsprogs btrfs-progs cryptsetup curl fdisk ;;
+    void) long 'updating xbps' xbps-install -Syu xbps
+          long 'installing the tools' xbps-install -Sy dosfstools e2fsprogs btrfs-progs cryptsetup curl util-linux ;;
+    arch) long 'installing the tools' pacman -Sy --noconfirm --needed dosfstools e2fsprogs btrfs-progs cryptsetup curl ;;
+    debian) long 'reading the package lists' apt-get update
+            long 'installing the tools' apt-get install -y debootstrap dosfstools e2fsprogs btrfs-progs cryptsetup curl fdisk ;;
   esac
   ok 'tools ready'
 }
 
 # ---- network -----------------------------------------------------------------
 
-online() { curl -fsS --max-time 8 -o /dev/null https://github.com 2>/dev/null; }
+# Online without curl (Void live has none): any of the downloaders, else a
+# plain TCP connection to GitHub.
+online() {
+  if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 8 -o /dev/null https://github.com 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then wget -q -T 8 -O /dev/null https://github.com 2>/dev/null
+  else timeout 8 bash -c ': < /dev/tcp/github.com/443' 2>/dev/null
+  fi
+}
 
 wifi_iface() { for d in /sys/class/net/*; do [ -d "$d/wireless" ] && { basename "$d"; return; }; done; }
+cable_ifaces() {
+  local d n
+  for d in /sys/class/net/*; do
+    n=${d##*/}
+    case "$n" in lo|tailscale*|docker*|virbr*|veth*|br-*) continue ;; esac
+    [ -d "$d/wireless" ] || [ ! -e "$d/device" ] || printf '%s\n' "$n"
+  done
+}
+# The interface that carries the default route: "cable (eno1)" or "Wi-Fi (wlan0)".
+route_desc() {
+  local dev; dev=$(ip route show default 2>/dev/null | head -n 1 | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+  [ -n "$dev" ] || { printf 'the network'; return 0; }
+  if [ -d "/sys/class/net/$dev/wireless" ]; then printf 'Wi-Fi (%s)' "$dev"; else printf 'cable or USB (%s)' "$dev"; fi
+}
 
-# Wi-Fi first (laptops), a cable as the fallback. The network that works is
-# remembered and written into the new system.
+# Wi-Fi cards on the PCI bus, with the driver the live system loaded (if any).
+WIFI_DRIVER=none
+wifi_hardware() {
+  local d vendor device drv found=0
+  for d in /sys/bus/pci/devices/*; do
+    case "$(cat "$d/class" 2>/dev/null)" in 0x0280*) ;; *) continue ;; esac
+    vendor=$(cat "$d/vendor"); device=$(cat "$d/device"); found=1
+    drv=$( [ -e "$d/driver" ] && basename "$(readlink "$d/driver")" || echo none)
+    if command -v lspci >/dev/null 2>&1; then
+      say "    card:   $(lspci -s "${d##*/}" | cut -d' ' -f2- | sed 's/^Network controller: //')"
+    else
+      say "    card:   PCI ${vendor#0x}:${device#0x}"
+    fi
+    say "    driver: $drv"
+    [ "$drv" = none ] || WIFI_DRIVER=$drv
+  done
+  [ "$found" = 1 ] || say '    no Wi-Fi card on the PCI bus (a USB Wi-Fi stick may work once plugged in)'
+}
+
+# Explain why there is no Wi-Fi, and what to do about it.
+no_wifi_help() {
+  warn 'No Wi-Fi is available on this live system.'
+  if command -v rfkill >/dev/null 2>&1 && rfkill list wifi 2>/dev/null | grep -q 'Hard blocked: yes'; then
+    say '    Wi-Fi is switched off with a hardware switch or a key (often Fn plus'
+    say '    a key with an antenna). Switch it on, then press Enter.'
+    return
+  fi
+  wifi_hardware
+  if [ "$WIFI_DRIVER" = none ]; then
+    say '    The live system has no driver for this card.'
+  else
+    say "    The $WIFI_DRIVER driver is loaded, but the live system probably lacks the"
+    say '    firmware it needs.'
+  fi
+  say '    That is common and only affects the live USB: the installed system'
+  say '    gets full firmware, so Wi-Fi will most likely work after the restart.'
+}
+
+offline_options() {
+  say ''
+  say "${B}Get online another way, then press Enter:${N}"
+  say '  - plug in a network cable (it connects by itself), or'
+  say '  - connect your phone with a USB cable and turn on USB tethering'
+  say '    (Android: Settings, Hotspot, USB tethering; iPhone: Personal Hotspot).'
+}
+
+# Wi-Fi first (laptops), a cable or USB tethering as the fallback. The Wi-Fi
+# network that works is remembered and written into the new system.
 network() {
   step 'Network'
+  say 'Checking the internet connection...'
   if online; then
-    ok 'online'
+    ok "online through $(route_desc)"
     remember_wifi
     return 0
   fi
-  local ifc; ifc=$(wifi_iface || true)
-  if [ -n "$ifc" ] && [ "$ASSUME_YES" != 1 ]; then
-    say "Not online. Connect to Wi-Fi on $ifc (leave the name empty to use a cable instead)."
-    rfkill unblock wifi 2>/dev/null || :
-    ip link set "$ifc" up 2>/dev/null || :
-    show_networks "$ifc"
-    read -r -p 'Wi-Fi name (SSID): ' WIFI_SSID < /dev/tty
-    if [ -n "$WIFI_SSID" ]; then
-      read -r -s -p 'Wi-Fi password: ' WIFI_PSK < /dev/tty; echo
-      wifi_connect "$ifc" || warn 'could not connect with that name and password'
-    fi
-  fi
-  if ! online; then
-    say 'Trying a network cable...'
+  say 'Not online yet.'
+  # A cable may simply need DHCP.
+  if [ -n "$(cable_ifaces)" ]; then
+    say "Trying the network port(s): $(cable_ifaces | xargs)..."
     cable_connect
+    if online; then ok "online through $(route_desc)"; return 0; fi
+    say '  no connection there (no cable plugged in?)'
   fi
-  online || die 'no network: connect Wi-Fi or a cable and run niruboot again'
-  ok 'online'
+  if [ "$ASSUME_YES" = 1 ]; then die 'no network: connect a cable or Wi-Fi and run niruboot again'; fi
+  local ifc tries=0 answer
+  if command -v rfkill >/dev/null 2>&1; then rfkill unblock wifi 2>/dev/null || :; fi
+  while :; do
+    ifc=$(wifi_iface || true)
+    if [ -n "$ifc" ] && [ "$tries" -lt 3 ]; then
+      ip link set "$ifc" up 2>/dev/null || :
+      say ''
+      say "${B}Connect to Wi-Fi${N} on $ifc. Looking for networks..."
+      show_networks "$ifc"
+      say '(Leave the name empty to use a cable or USB tethering instead.)'
+      read -r -p 'Wi-Fi name (SSID): ' WIFI_SSID < /dev/tty || WIFI_SSID=
+      if [ -n "$WIFI_SSID" ]; then
+        read -r -s -p "Password for $WIFI_SSID (empty if open): " WIFI_PSK < /dev/tty || WIFI_PSK=
+        echo
+        say "Connecting to $WIFI_SSID (up to 30 seconds)..."
+        if wifi_connect "$ifc"; then ok "online through Wi-Fi $WIFI_SSID"; return 0; fi
+        tries=$((tries + 1))
+        warn "Could not connect to $WIFI_SSID. Check the name (capitals count) and the password."
+        WIFI_SSID='' WIFI_PSK=''
+        continue
+      fi
+      WIFI_SSID='' WIFI_PSK=''
+    elif [ -z "$ifc" ]; then
+      no_wifi_help
+    fi
+    offline_options
+    read -r -p 'Press Enter when connected (or type q to quit): ' answer < /dev/tty || answer=q
+    case "$answer" in q|Q) die 'stopped: no network. Run niruboot again when you are online.' ;; esac
+    say 'Checking again...'
+    cable_connect
+    if online; then ok "online through $(route_desc)"; return 0; fi
+    say '  still not online'
+    tries=0
+  done
 }
 
 show_networks() {
-  if command -v nmcli >/dev/null 2>&1; then
-    nmcli -f SSID,SIGNAL,SECURITY device wifi list ifname "$1" 2>/dev/null | head -15 || :
+  local list=
+  if command -v nmcli >/dev/null 2>&1 && nmcli general status >/dev/null 2>&1; then
+    nmcli device wifi rescan ifname "$1" >/dev/null 2>&1 || :; sleep 2
+    list=$(nmcli -f SSID,SIGNAL,SECURITY device wifi list ifname "$1" 2>/dev/null | head -15 || :)
   elif command -v iwctl >/dev/null 2>&1; then
-    iwctl station "$1" scan 2>/dev/null || :; sleep 3
-    iwctl station "$1" get-networks 2>/dev/null | head -20 || :
+    iwctl station "$1" scan >/dev/null 2>&1 || :; sleep 3
+    list=$(iwctl station "$1" get-networks 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | head -20 || :)
   elif command -v iw >/dev/null 2>&1; then
-    iw dev "$1" scan 2>/dev/null | sed -n 's/^[[:space:]]*SSID: //p' | sort -u | head -20 || :
+    list=$(iw dev "$1" scan 2>/dev/null | sed -n 's/^[[:space:]]*SSID: //p' | grep -v '^$' | sort -u | head -20 || :)
   fi
+  if [ -n "$list" ]; then printf '%s\n' "$list"; else say '  (no networks found; you can still type the name)'; fi
 }
 
 wifi_connect() {
   local ifc=$1
   if command -v nmcli >/dev/null 2>&1 && nmcli general status >/dev/null 2>&1; then
-    printf '802-11-wireless-security.psk:%s\n' "$WIFI_PSK" > /tmp/.nb-wifi; chmod 600 /tmp/.nb-wifi
-    nmcli --wait 30 device wifi connect "$WIFI_SSID" passwd-file /tmp/.nb-wifi ifname "$ifc" >> "$LOG" 2>&1 || :
-    rm -f /tmp/.nb-wifi
+    if [ -n "$WIFI_PSK" ]; then
+      printf '802-11-wireless-security.psk:%s\n' "$WIFI_PSK" > /tmp/.nb-wifi; chmod 600 /tmp/.nb-wifi
+      nmcli --wait 30 device wifi connect "$WIFI_SSID" passwd-file /tmp/.nb-wifi ifname "$ifc" >> "$LOG" 2>&1 || :
+      rm -f /tmp/.nb-wifi
+    else
+      nmcli --wait 30 device wifi connect "$WIFI_SSID" ifname "$ifc" >> "$LOG" 2>&1 || :
+    fi
   elif command -v iwctl >/dev/null 2>&1; then
-    iwctl --passphrase "$WIFI_PSK" station "$ifc" connect "$WIFI_SSID" >> "$LOG" 2>&1 || :
+    if [ -n "$WIFI_PSK" ]; then
+      iwctl --passphrase "$WIFI_PSK" station "$ifc" connect "$WIFI_SSID" >> "$LOG" 2>&1 || :
+    else
+      iwctl station "$ifc" connect "$WIFI_SSID" >> "$LOG" 2>&1 || :
+    fi
   elif command -v wpa_supplicant >/dev/null 2>&1; then
-    (umask 077; wpa_passphrase "$WIFI_SSID" "$WIFI_PSK" > /tmp/.nb-wpa.conf) 2>> "$LOG" || return 1
+    if [ -n "$WIFI_PSK" ]; then
+      (umask 077; wpa_passphrase "$WIFI_SSID" "$WIFI_PSK" > /tmp/.nb-wpa.conf) 2>> "$LOG" || return 1
+    else
+      (umask 077; printf 'network={\n  ssid="%s"\n  key_mgmt=NONE\n}\n' "$WIFI_SSID" > /tmp/.nb-wpa.conf)
+    fi
     pkill -f "wpa_supplicant.*$ifc" 2>/dev/null || :
+    sleep 1
     wpa_supplicant -B -i "$ifc" -c /tmp/.nb-wpa.conf >> "$LOG" 2>&1 || :
     dhcp_on "$ifc"
+  else
+    warn 'no Wi-Fi tool on this live system (nmcli, iwctl or wpa_supplicant)'
+    return 1
   fi
   for _ in $(seq 1 20); do online && return 0; sleep 1; done
   return 1
 }
 
 dhcp_on() {
-  if command -v dhcpcd >/dev/null 2>&1; then dhcpcd -w "$1" >> "$LOG" 2>&1 || :
-  elif command -v dhclient >/dev/null 2>&1; then dhclient "$1" >> "$LOG" 2>&1 || :
+  if command -v dhcpcd >/dev/null 2>&1; then timeout 30 dhcpcd -w "$1" >> "$LOG" 2>&1 || :
+  elif command -v dhclient >/dev/null 2>&1; then timeout 30 dhclient "$1" >> "$LOG" 2>&1 || :
   fi
 }
 
+# Cable and USB tethering (usb0, enp...u...) get an address by DHCP.
 cable_connect() {
-  local d n
-  for d in /sys/class/net/*; do
-    n=$(basename "$d")
-    [ "$n" = lo ] || [ -d "$d/wireless" ] && continue
+  local n
+  for n in $(cable_ifaces); do
     ip link set "$n" up 2>/dev/null || :
-    command -v nmcli >/dev/null 2>&1 && nmcli device connect "$n" >> "$LOG" 2>&1 && continue
+    if command -v nmcli >/dev/null 2>&1 && nmcli general status >/dev/null 2>&1; then
+      nmcli device connect "$n" >> "$LOG" 2>&1 && continue
+    fi
+    [ "$(cat "/sys/class/net/$n/carrier" 2>/dev/null)" = 1 ] || continue
     dhcp_on "$n"
   done
   sleep 3
 }
 
-# When the live system is already on Wi-Fi through NetworkManager, take the
-# active network's name and password along to the new system.
+# When the live system is already on Wi-Fi, take the network's name and
+# password along to the new system: from NetworkManager, iwd (Arch ISO) or
+# wpa_supplicant (Void live). If only the name is found, ask for the password.
 remember_wifi() {
   [ -z "$WIFI_SSID" ] || return 0
-  command -v nmcli >/dev/null 2>&1 || return 0
-  local con
-  con=$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | awk -F: '$2 == "802-11-wireless" {print $1; exit}')
-  [ -n "$con" ] || return 0
-  WIFI_SSID=$(nmcli -s -g 802-11-wireless.ssid connection show "$con" 2>/dev/null || true)
-  WIFI_PSK=$(nmcli -s -g 802-11-wireless-security.psk connection show "$con" 2>/dev/null || true)
+  local con ifc cfg f
+  ifc=$(wifi_iface || true)
+  [ -n "$ifc" ] || return 0
+  if command -v nmcli >/dev/null 2>&1 && nmcli general status >/dev/null 2>&1; then
+    con=$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | awk -F: '$2 == "802-11-wireless" {print $1; exit}')
+    if [ -n "$con" ]; then
+      WIFI_SSID=$(nmcli -s -g 802-11-wireless.ssid connection show "$con" 2>/dev/null || true)
+      WIFI_PSK=$(nmcli -s -g 802-11-wireless-security.psk connection show "$con" 2>/dev/null || true)
+    fi
+  fi
+  if [ -z "$WIFI_SSID" ] && command -v iwctl >/dev/null 2>&1; then
+    WIFI_SSID=$(iwctl station "$ifc" show 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '$1 == "Connected" && $2 == "network" {$1 = $2 = ""; sub(/^ +/, ""); sub(/ +$/, ""); print; exit}')
+    f="/var/lib/iwd/$WIFI_SSID.psk"
+    if [ -n "$WIFI_SSID" ] && [ -r "$f" ]; then
+      WIFI_PSK=$(sed -n 's/^Passphrase=//p' "$f" | head -n 1)
+      [ -n "$WIFI_PSK" ] || WIFI_PSK=$(sed -n 's/^PreSharedKey=//p' "$f" | head -n 1)
+    fi
+  fi
+  if [ -z "$WIFI_SSID" ] && command -v wpa_cli >/dev/null 2>&1; then
+    WIFI_SSID=$(wpa_cli -i "$ifc" status 2>/dev/null | sed -n 's/^ssid=//p' | head -n 1)
+    cfg=$(tr '\0' ' ' < "/proc/$(pgrep -f "wpa_supplicant.*$ifc" | head -n 1)/cmdline" 2>/dev/null | grep -o -- '-c *[^ ]*' | head -n 1 | sed 's/^-c *//')
+    if [ -n "$WIFI_SSID" ] && [ -r "$cfg" ]; then
+      WIFI_PSK=$(awk -v s="\"$WIFI_SSID\"" '/^[[:space:]]*ssid=/ {split($0, a, "="); cur = (a[2] == s)} cur && /^[[:space:]]*psk=/ {sub(/^[[:space:]]*psk=/, ""); gsub(/"/, ""); print; exit}' "$cfg")
+    fi
+  fi
+  [ -n "$WIFI_SSID" ] || return 0
+  if [ -n "$WIFI_PSK" ]; then ok "Wi-Fi $WIFI_SSID will be saved in the new system"; return 0; fi
+  if [ "$ASSUME_YES" != 1 ]; then
+    say "To save Wi-Fi $WIFI_SSID in the new system, type its password."
+    read -r -s -p 'Wi-Fi password (empty to skip): ' WIFI_PSK < /dev/tty || WIFI_PSK=
+    echo
+  fi
+  [ -n "$WIFI_PSK" ] || { say '  not saved; connect with nmtui after the first login'; WIFI_SSID=; }
 }
 
 # ---- questions ---------------------------------------------------------------
@@ -429,7 +603,7 @@ install_void() {
   has_gpu intel && pkgs+=(mesa-vulkan-intel intel-video-accel)
   has_gpu amd && pkgs+=(mesa-vulkan-radeon mesa-vaapi)
   [ "$CPU_VENDOR" = amd ] && pkgs+=(linux-firmware-amd)
-  XBPS_ARCH=x86_64 quiet xbps-install -Sy -R "$VOID_REPO" -r "$TARGET" "${pkgs[@]}"
+  XBPS_ARCH=x86_64 long "downloading and installing ${#pkgs[@]} packages" xbps-install -Sy -R "$VOID_REPO" -r "$TARGET" "${pkgs[@]}"
   ok 'base system'
   if [ "$CPU_VENDOR" = intel ]; then
     XBPS_ARCH=x86_64 quiet xbps-install -Sy -R "$VOID_REPO" -R "$VOID_REPO/nonfree" -r "$TARGET" intel-ucode
@@ -462,7 +636,7 @@ install_void() {
   printf 'ZRAM_SIZE=50\n' > "$TARGET/etc/zramen.conf" 2>/dev/null || :
   common_system
   grub_install void
-  quiet in_target xbps-reconfigure -fa
+  long 'configuring all packages and building the initramfs' in_target xbps-reconfigure -fa
   ok 'kernel, initramfs and boot loader'
 }
 
@@ -483,7 +657,7 @@ install_arch() {
   # some live images strip documentation and locales); the new system gets a
   # complete copy of it.
   grep -v '^[[:space:]]*NoExtract' /etc/pacman.conf > /tmp/niruboot-pacman.conf
-  quiet pacstrap -K -C /tmp/niruboot-pacman.conf "$TARGET" "${pkgs[@]}"
+  long "downloading and installing ${#pkgs[@]} packages" pacstrap -K -C /tmp/niruboot-pacman.conf "$TARGET" "${pkgs[@]}"
   [ -s "$TARGET/etc/pacman.conf" ] || install -m 644 /tmp/niruboot-pacman.conf "$TARGET/etc/pacman.conf"
   ok 'base system'
   write_fstab
@@ -503,7 +677,7 @@ install_arch() {
   sed -i "s/^HOOKS=.*/HOOKS=($hooks)/" "$TARGET/etc/mkinitcpio.conf"
   printf '[zram0]\nzram-size = min(ram / 2, 8192)\ncompression-algorithm = zstd\n' > "$TARGET/etc/systemd/zram-generator.conf"
   common_system
-  quiet in_target mkinitcpio -P
+  long 'building the initramfs' in_target mkinitcpio -P
   grub_install arch
   quiet in_target systemctl enable NetworkManager sshd systemd-timesyncd fstrim.timer
   ok 'kernel, initramfs and boot loader'
@@ -513,7 +687,7 @@ install_arch() {
 
 install_debian() {
   step "Installing Debian ($DEBIAN_SUITE)"
-  quiet debootstrap --arch=amd64 --include=locales,ca-certificates "$DEBIAN_SUITE" "$TARGET" "$DEBIAN_MIRROR"
+  long 'downloading and installing the base system' debootstrap --arch=amd64 --include=locales,ca-certificates "$DEBIAN_SUITE" "$TARGET" "$DEBIAN_MIRROR"
   ok 'base system'
   cat > "$TARGET/etc/apt/sources.list.d/debian.sources" <<EOF
 Types: deb
@@ -557,8 +731,8 @@ EOF
   [ "$CPU_VENDOR" = amd ] && pkgs+=(amd64-microcode)
   has_gpu intel && pkgs+=(intel-media-va-driver-non-free)
   [ "$FORM" = laptop ] && pkgs+=(firmware-iwlwifi firmware-realtek firmware-atheros)
-  quiet in_target apt-get update
-  quiet in_target apt-get install -y --no-install-recommends "${pkgs[@]}"
+  long 'reading the package lists' in_target apt-get update
+  long "downloading and installing ${#pkgs[@]} packages" in_target apt-get install -y --no-install-recommends "${pkgs[@]}"
   ok 'kernel, firmware and tools'
   printf '[zram0]\nzram-size = min(ram / 2, 8192)\ncompression-algorithm = zstd\n' > "$TARGET/etc/systemd/zram-generator.conf"
   # The console keymap in the initramfs: the disk password is typed with the
@@ -566,7 +740,7 @@ EOF
   sed -i 's/^#\?KEYMAP=.*/KEYMAP=y/' "$TARGET/etc/initramfs-tools/initramfs.conf"
   quiet in_target setupcon --save-only || :
   common_system
-  quiet in_target update-initramfs -u -k all
+  long 'building the initramfs' in_target update-initramfs -u -k all
   grub_install debian
   quiet in_target systemctl enable NetworkManager ssh systemd-timesyncd fstrim.timer
   ok 'initramfs and boot loader'
@@ -713,6 +887,11 @@ finish() {
   [ "$ENCRYPT" = yes ] && say '  2. Type the disk password at start (Swedish keyboard).'
   say "  3. Log in as $USERNAME on the text console."
   say '  4. Install NIRUX: ~/install-nirux'
+  if [ -z "$WIFI_SSID" ]; then
+    say ''
+    say 'No Wi-Fi network is saved in the new system: keep the cable (or USB'
+    say 'tethering) connected for step 4, or connect Wi-Fi first with: nmtui'
+  fi
   say ''
   say "Log: $LOG (also in /var/log/niruboot.log on the new system, without passwords)."
 }
@@ -738,8 +917,8 @@ main() {
     *) usage >&2; exit 2 ;;
   esac
   preflight
-  live_tools
   network
+  live_tools
   hardware
   questions
   partition

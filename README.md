@@ -140,6 +140,13 @@ installer for dual boot.
 **Another user name?** Set `NIRUBOOT_USER=name` before the command:
 `sudo NIRUBOOT_USER=anna bash niruboot`.
 
+**No Wi-Fi on the live USB?** Some Wi-Fi cards lack a driver or firmware on
+the live system. Use a network cable, or connect your phone with a USB cable
+and turn on USB tethering, then run `sudo dhcpcd`. If NIRUBOOT finds no
+network, it shows the Wi-Fi card and its driver and waits while you connect
+another way. The installed system gets full firmware, so Wi-Fi usually works
+after the restart; connect with `nmtui` after the first login.
+
 **Something went wrong.** Nothing is changed before you type the disk name.
 After that, the log is in `/tmp/niruboot.log` on the live system; run the
 script again to start over. On the installed system the log is

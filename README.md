@@ -69,8 +69,11 @@ Plug in the stick, start the computer and open the boot menu (often `F12`,
 
 ### 3. Get online
 
-The script connects Wi-Fi for you if the computer is offline, so you can skip
-this. With a network cable it is automatic. If you want to connect first:
+The installation needs internet, and the script must be downloaded first, so
+connect before step 4. A network cable is the easiest: it connects by itself.
+If Wi-Fi does not show up on the live system (some cards lack firmware
+there), use a cable or USB tethering from your phone and run `sudo dhcpcd`.
+To connect Wi-Fi:
 
 | Live system | Connect Wi-Fi |
 |---|---|
@@ -87,8 +90,17 @@ curl -fsSL https://raw.githubusercontent.com/nirucon/niruboot/main/niruboot -o n
 sudo bash niruboot
 ```
 
-Debian live may lack curl; use `wget -O niruboot URL` with the same address
-instead. On the Arch ISO you are root already, so `bash niruboot` is enough.
+Void live has no curl; download with its own `xbps-fetch` instead:
+
+```sh
+xbps-fetch -o niruboot https://raw.githubusercontent.com/nirucon/niruboot/main/niruboot
+sudo bash niruboot
+```
+
+Debian live may lack curl too; use `wget -O niruboot URL` with the same
+address. On the Arch ISO you are root already, so `bash niruboot` is enough.
+On Void live, the user is `anon` and the password (also for sudo) is
+`voidlinux`.
 
 It asks:
 

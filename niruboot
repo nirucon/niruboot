@@ -1,0 +1,749 @@
+#!/usr/bin/env bash
+# NIRUBOOT: a clean Void, Arch or Debian installation from the live USB,
+# ready for NIRUX (or anything else) on the first login.
+#
+#   curl -fsSL https://raw.githubusercontent.com/nirucon/niruboot/main/niruboot -o niruboot
+#   sudo bash niruboot
+#
+# It asks for the disk, the computer type (laptop or desktop), the computer
+# name, encryption and the password, then:
+#   - erases the disk: EFI (FAT32), /boot (ext4), root (btrfs, optionally
+#     inside LUKS2) with the subvolumes @, @home, @snapshots, @var_log,
+#     @var_cache and, on laptops, @swap with a swap file;
+#   - installs the base system with the kernel, firmware, CPU microcode,
+#     graphics drivers, NetworkManager, sudo, SSH, time sync and zram;
+#   - sets English (en_US.UTF-8), the Swedish keyboard and Stockholm time;
+#   - creates the user (niru) with sudo and locks root;
+#   - copies the Wi-Fi network used for the installation, so the first boot
+#     is online, and leaves ~/install-nirux for the next step.
+# The live system decides the distribution: run it from the Void, Arch or
+# Debian live USB. UEFI only. See README.md.
+set -Eeuo pipefail
+
+VERSION=0.1.0
+LOG=/tmp/niruboot.log
+TARGET=${NIRUBOOT_TARGET:-/mnt}
+MAPPER=cryptroot
+DEBIAN_SUITE=${NIRUBOOT_DEBIAN_SUITE:-trixie}
+DEBIAN_MIRROR=${NIRUBOOT_DEBIAN_MIRROR:-http://deb.debian.org/debian}
+VOID_REPO=${NIRUBOOT_VOID_REPO:-https://repo-default.voidlinux.org/current}
+NIRUX_REPO=https://github.com/nirucon/nirux
+
+# Answers. Every one can be given in the environment for unattended use and
+# testing (the passwords through files, never on the command line).
+DISK=${NIRUBOOT_DISK:-}
+FORM=${NIRUBOOT_FORM:-}              # laptop | desktop
+HOSTNAME_NEW=${NIRUBOOT_HOSTNAME:-}
+USERNAME=${NIRUBOOT_USER:-niru}
+ENCRYPT=${NIRUBOOT_ENCRYPT:-}        # yes | no
+TIMEZONE=${NIRUBOOT_TIMEZONE:-Europe/Stockholm}
+KEYMAP_CONSOLE='sv-latin1'
+XKB_LAYOUT=se
+LOCALE=en_US.UTF-8
+ASSUME_YES=${NIRUBOOT_YES:-0}
+EXTRA_CMDLINE=${NIRUBOOT_EXTRA_CMDLINE:-}
+PASSWORD=
+LUKS_PASSWORD=
+WIFI_SSID=
+WIFI_PSK=
+
+# ---- output ------------------------------------------------------------------
+
+if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'; else B='' G='' Y='' R='' N=''; fi
+say()  { printf '%s\n' "$*"; printf '%s\n' "$*" >> "$LOG"; }
+step() { printf '\n%s==> %s%s\n' "$B" "$*" "$N"; printf '\n==> %s\n' "$*" >> "$LOG"; }
+ok()   { printf '%s  ok%s %s\n' "$G" "$N" "$*"; printf '  ok %s\n' "$*" >> "$LOG"; }
+warn() { printf '%s  !%s %s\n' "$Y" "$N" "$*"; printf '  ! %s\n' "$*" >> "$LOG"; }
+die()  { printf '\n%sniruboot: %s%s\n' "$R" "$*" "$N" >&2; printf 'niruboot: %s\n' "$*" >> "$LOG"; exit 1; }
+# Run a command with its output in the log only.
+quiet() { "$@" >> "$LOG" 2>&1; }
+trap 'printf "\n%sniruboot stopped at line %s. Details: %s%s\n" "$R" "$LINENO" "$LOG" "$N" >&2' ERR
+
+ask() { # ask VAR "Question" default
+  local answer
+  if [ "$ASSUME_YES" = 1 ]; then printf -v "$1" '%s' "$3"; return; fi
+  read -r -p "$2 [$3]: " answer < /dev/tty || answer=
+  printf -v "$1" '%s' "${answer:-$3}"
+}
+ask_secret() { # ask_secret VAR "What"
+  local a b
+  while :; do
+    read -r -s -p "$2: " a < /dev/tty; echo
+    read -r -s -p "$2 again: " b < /dev/tty; echo
+    if [ -z "$a" ]; then warn 'it cannot be empty'; continue; fi
+    if [ "$a" != "$b" ]; then warn 'they did not match, try again'; continue; fi
+    printf -v "$1" '%s' "$a"; return
+  done
+}
+secret_from() { # secret_from VAR FILE
+  [ -n "${2:-}" ] && [ -f "$2" ] || return 1
+  printf -v "$1" '%s' "$(head -n 1 "$2")"
+}
+
+# ---- checks ------------------------------------------------------------------
+
+DISTRO=
+detect_distro() {
+  local id like
+  id=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')
+  like=$(sed -n 's/^ID_LIKE=//p' /etc/os-release | tr -d '"')
+  case "${NIRUBOOT_DISTRO:-$id}" in
+    void) DISTRO=void ;;
+    arch|archlinux) DISTRO=arch ;;
+    debian) DISTRO=debian ;;
+    *) case " $like " in *" arch "*) DISTRO=arch ;; *" debian "*) DISTRO=debian ;; esac ;;
+  esac
+  [ -n "$DISTRO" ] || die "run this from the Void, Arch or Debian live USB (this is: ${id:-unknown})"
+}
+
+preflight() {
+  [ "$(id -u)" = 0 ] || die 'run as root: sudo bash niruboot'
+  [ "$(uname -m)" = x86_64 ] || die 'x86_64 only'
+  [ -d /sys/firmware/efi ] || die 'this computer started the live USB in legacy BIOS mode; start it in UEFI mode'
+  detect_distro
+  : > "$LOG"; chmod 600 "$LOG"
+  say "NIRUBOOT $VERSION · installing $DISTRO"
+}
+
+# Tools the live system must have. Debian live lacks debootstrap and some
+# file system tools, Void live lacks a few; install them into the live
+# system (RAM) when missing.
+live_tools() {
+  local need=() t
+  for t in sfdisk wipefs mkfs.fat mkfs.ext4 mkfs.btrfs cryptsetup curl lsblk blkid; do
+    command -v "$t" >/dev/null 2>&1 || need+=("$t")
+  done
+  [ "$DISTRO" != debian ] || command -v debootstrap >/dev/null 2>&1 || need+=(debootstrap)
+  [ "$DISTRO" != arch ] || command -v pacstrap >/dev/null 2>&1 || die 'pacstrap is missing (use the official Arch ISO)'
+  [ "${#need[@]}" = 0 ] && return 0
+  step "Adding tools to the live system: ${need[*]}"
+  case "$DISTRO" in
+    void) quiet xbps-install -Syu xbps && quiet xbps-install -Sy dosfstools e2fsprogs btrfs-progs cryptsetup curl util-linux ;;
+    arch) quiet pacman -Sy --noconfirm --needed dosfstools e2fsprogs btrfs-progs cryptsetup curl ;;
+    debian) quiet apt-get update && quiet apt-get install -y debootstrap dosfstools e2fsprogs btrfs-progs cryptsetup curl fdisk ;;
+  esac
+  ok 'tools ready'
+}
+
+# ---- network -----------------------------------------------------------------
+
+online() { curl -fsS --max-time 8 -o /dev/null https://github.com 2>/dev/null; }
+
+wifi_iface() { for d in /sys/class/net/*; do [ -d "$d/wireless" ] && { basename "$d"; return; }; done; }
+
+# Wi-Fi first (laptops), a cable as the fallback. The network that works is
+# remembered and written into the new system.
+network() {
+  step 'Network'
+  if online; then
+    ok 'online'
+    remember_wifi
+    return 0
+  fi
+  local ifc; ifc=$(wifi_iface || true)
+  if [ -n "$ifc" ] && [ "$ASSUME_YES" != 1 ]; then
+    say "Not online. Connect to Wi-Fi on $ifc (leave the name empty to use a cable instead)."
+    rfkill unblock wifi 2>/dev/null || :
+    ip link set "$ifc" up 2>/dev/null || :
+    show_networks "$ifc"
+    read -r -p 'Wi-Fi name (SSID): ' WIFI_SSID < /dev/tty
+    if [ -n "$WIFI_SSID" ]; then
+      read -r -s -p 'Wi-Fi password: ' WIFI_PSK < /dev/tty; echo
+      wifi_connect "$ifc" || warn 'could not connect with that name and password'
+    fi
+  fi
+  if ! online; then
+    say 'Trying a network cable...'
+    cable_connect
+  fi
+  online || die 'no network: connect Wi-Fi or a cable and run niruboot again'
+  ok 'online'
+}
+
+show_networks() {
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli -f SSID,SIGNAL,SECURITY device wifi list ifname "$1" 2>/dev/null | head -15 || :
+  elif command -v iwctl >/dev/null 2>&1; then
+    iwctl station "$1" scan 2>/dev/null || :; sleep 3
+    iwctl station "$1" get-networks 2>/dev/null | head -20 || :
+  elif command -v iw >/dev/null 2>&1; then
+    iw dev "$1" scan 2>/dev/null | sed -n 's/^[[:space:]]*SSID: //p' | sort -u | head -20 || :
+  fi
+}
+
+wifi_connect() {
+  local ifc=$1
+  if command -v nmcli >/dev/null 2>&1 && nmcli general status >/dev/null 2>&1; then
+    printf '802-11-wireless-security.psk:%s\n' "$WIFI_PSK" > /tmp/.nb-wifi; chmod 600 /tmp/.nb-wifi
+    nmcli --wait 30 device wifi connect "$WIFI_SSID" passwd-file /tmp/.nb-wifi ifname "$ifc" >> "$LOG" 2>&1 || :
+    rm -f /tmp/.nb-wifi
+  elif command -v iwctl >/dev/null 2>&1; then
+    iwctl --passphrase "$WIFI_PSK" station "$ifc" connect "$WIFI_SSID" >> "$LOG" 2>&1 || :
+  elif command -v wpa_supplicant >/dev/null 2>&1; then
+    (umask 077; wpa_passphrase "$WIFI_SSID" "$WIFI_PSK" > /tmp/.nb-wpa.conf) 2>> "$LOG" || return 1
+    pkill -f "wpa_supplicant.*$ifc" 2>/dev/null || :
+    wpa_supplicant -B -i "$ifc" -c /tmp/.nb-wpa.conf >> "$LOG" 2>&1 || :
+    dhcp_on "$ifc"
+  fi
+  for _ in $(seq 1 20); do online && return 0; sleep 1; done
+  return 1
+}
+
+dhcp_on() {
+  if command -v dhcpcd >/dev/null 2>&1; then dhcpcd -w "$1" >> "$LOG" 2>&1 || :
+  elif command -v dhclient >/dev/null 2>&1; then dhclient "$1" >> "$LOG" 2>&1 || :
+  fi
+}
+
+cable_connect() {
+  local d n
+  for d in /sys/class/net/*; do
+    n=$(basename "$d")
+    [ "$n" = lo ] || [ -d "$d/wireless" ] && continue
+    ip link set "$n" up 2>/dev/null || :
+    command -v nmcli >/dev/null 2>&1 && nmcli device connect "$n" >> "$LOG" 2>&1 && continue
+    dhcp_on "$n"
+  done
+  sleep 3
+}
+
+# When the live system is already on Wi-Fi through NetworkManager, take the
+# active network's name and password along to the new system.
+remember_wifi() {
+  [ -z "$WIFI_SSID" ] || return 0
+  command -v nmcli >/dev/null 2>&1 || return 0
+  local con
+  con=$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | awk -F: '$2 == "802-11-wireless" {print $1; exit}')
+  [ -n "$con" ] || return 0
+  WIFI_SSID=$(nmcli -s -g 802-11-wireless.ssid connection show "$con" 2>/dev/null || true)
+  WIFI_PSK=$(nmcli -s -g 802-11-wireless-security.psk connection show "$con" 2>/dev/null || true)
+}
+
+# ---- questions ---------------------------------------------------------------
+
+# Disks that can be installed to: not the live medium, not loop or CD.
+list_disks() {
+  local live
+  live=$(findmnt -no SOURCE /run/initramfs/live 2>/dev/null || findmnt -no SOURCE /run/archiso/bootmnt 2>/dev/null ||
+         findmnt -no SOURCE /run/live/medium 2>/dev/null || true)
+  live=${live:+$(lsblk -no PKNAME "$live" 2>/dev/null | head -n 1)}
+  lsblk -dpno NAME,SIZE,TYPE,TRAN,MODEL | awk -v live="/dev/$live" '$3 == "disk" && $1 != live && $1 !~ /loop|sr|zram/'
+}
+
+questions() {
+  step 'Questions'
+  if [ -z "$DISK" ]; then
+    say 'Disks found (everything on the chosen one is erased):'
+    list_disks | nl -w2 -s') '
+    local first; first=$(list_disks | awk 'NR == 1 {print $1}')
+    [ -n "$first" ] || die 'no disk found to install to'
+    local choice
+    ask choice 'Disk (number or /dev/NAME)' 1
+    case "$choice" in
+      /dev/*) DISK=$choice ;;
+      *) DISK=$(list_disks | awk -v n="$choice" 'NR == n {print $1}') ;;
+    esac
+  fi
+  [ -b "$DISK" ] || die "not a disk: ${DISK:-none chosen}"
+
+  [ -n "$FORM" ] || ask FORM 'Laptop or desktop' laptop
+  case "$FORM" in l*|L*) FORM=laptop ;; d*|D*) FORM=desktop ;; *) die 'answer laptop or desktop' ;; esac
+
+  local default_name; default_name=$DISTRO-$FORM
+  [ -n "$HOSTNAME_NEW" ] || ask HOSTNAME_NEW 'Computer name' "$default_name"
+  [[ "$HOSTNAME_NEW" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$ ]] || die 'the computer name may use letters, digits and -'
+
+  if [ -z "$ENCRYPT" ]; then
+    local def=no; [ "$FORM" = laptop ] && def=yes
+    ask ENCRYPT 'Encrypt the disk (LUKS2, a password at every start)' "$def"
+  fi
+  case "$ENCRYPT" in y*|Y*|j*|J*) ENCRYPT=yes ;; *) ENCRYPT=no ;; esac
+
+  [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "invalid user name: $USERNAME"
+  if ! secret_from PASSWORD "${NIRUBOOT_PASSWORD_FILE:-}"; then
+    say "The password of $USERNAME (also used by sudo):"
+    ask_secret PASSWORD 'Password'
+  fi
+  if [ "$ENCRYPT" = yes ] && ! secret_from LUKS_PASSWORD "${NIRUBOOT_LUKS_PASSWORD_FILE:-}"; then
+    local same=yes
+    ask same 'Use the same password for the disk encryption' yes
+    case "$same" in y*|Y*|j*|J*) LUKS_PASSWORD=$PASSWORD ;; *) ask_secret LUKS_PASSWORD 'Disk password' ;; esac
+  fi
+
+  local size; size=$(lsblk -dbno SIZE "$DISK")
+  say ''
+  say "${B}About to install${N}"
+  say "  distribution  $DISTRO"
+  say "  disk          $DISK ($(numfmt --to=iec "$size") $(lsblk -dno MODEL "$DISK" | xargs)), ERASED"
+  say "  computer      $HOSTNAME_NEW ($FORM)"
+  say "  user          $USERNAME (sudo; root is locked)"
+  say "  encryption    $ENCRYPT"
+  say "  language      English ($LOCALE), Swedish keyboard, $TIMEZONE"
+  [ -z "$WIFI_SSID" ] || say "  Wi-Fi         $WIFI_SSID (copied to the new system)"
+  if [ "$ASSUME_YES" != 1 ]; then
+    local confirm
+    read -r -p "Type ${B}$(basename "$DISK")${N} to erase it and install: " confirm < /dev/tty
+    [ "$confirm" = "$(basename "$DISK")" ] || die 'cancelled; nothing was changed'
+  fi
+}
+
+# ---- disk --------------------------------------------------------------------
+
+part() { case "$DISK" in *[0-9]) printf '%sp%s' "$DISK" "$1" ;; *) printf '%s%s' "$DISK" "$1" ;; esac; }
+
+release_disk() {
+  swapoff -a 2>/dev/null || :
+  umount -R "$TARGET" 2>/dev/null || :
+  [ ! -e "/dev/mapper/$MAPPER" ] || cryptsetup close "$MAPPER" 2>/dev/null || :
+  local p
+  for p in $(lsblk -lnpo NAME "$DISK" | tail -n +2); do umount "$p" 2>/dev/null || :; done
+}
+
+ROOT_DEV=
+partition() {
+  step "Partitioning $DISK"
+  release_disk
+  local size_g efi_m
+  size_g=$(( $(lsblk -dbno SIZE "$DISK") / 1024 / 1024 / 1024 ))
+  [ "$size_g" -ge 24 ] || die "the disk is too small (${size_g} GiB; at least 24 GiB)"
+  efi_m=1024; [ "$size_g" -ge 64 ] || efi_m=512
+  quiet wipefs -af "$DISK"
+  quiet sfdisk --wipe always --wipe-partitions always "$DISK" <<EOF
+label: gpt
+size=${efi_m}MiB, type=U, name="EFI"
+size=1GiB, type=L, name="boot"
+type=L, name="root"
+EOF
+  quiet partprobe "$DISK" 2>/dev/null || :; udevadm settle 2>/dev/null || sleep 2
+  quiet mkfs.fat -F 32 -n EFI "$(part 1)"
+  quiet mkfs.ext4 -F -L boot "$(part 2)"
+  ROOT_DEV=$(part 3)
+  if [ "$ENCRYPT" = yes ]; then
+    printf '%s' "$LUKS_PASSWORD" | quiet cryptsetup luksFormat --type luks2 --batch-mode --key-file=- \
+      --label cryptroot "$ROOT_DEV"
+    printf '%s' "$LUKS_PASSWORD" | quiet cryptsetup open --key-file=- --allow-discards "$ROOT_DEV" "$MAPPER"
+    ROOT_DEV=/dev/mapper/$MAPPER
+    ok 'root encrypted (LUKS2)'
+  fi
+  quiet mkfs.btrfs -f -L root "$ROOT_DEV"
+  ok "EFI ${efi_m} MiB, /boot 1 GiB, btrfs root $((size_g - 2)) GiB"
+}
+
+BTRFS_OPTS=noatime,compress=zstd:1,space_cache=v2
+SWAP_G=0
+subvolumes() {
+  step 'btrfs subvolumes'
+  mount "$ROOT_DEV" "$TARGET"
+  local sv subvols=(@ @home @snapshots @var_log @var_cache)
+  [ "$FORM" = laptop ] && subvols+=(@swap)
+  for sv in "${subvols[@]}"; do quiet btrfs subvolume create "$TARGET/$sv"; done
+  umount "$TARGET"
+  mount -o "$BTRFS_OPTS,subvol=@" "$ROOT_DEV" "$TARGET"
+  mkdir -p "$TARGET"/{home,.snapshots,var/log,var/cache,boot}
+  mount -o "$BTRFS_OPTS,subvol=@home" "$ROOT_DEV" "$TARGET/home"
+  mount -o "$BTRFS_OPTS,subvol=@snapshots" "$ROOT_DEV" "$TARGET/.snapshots"
+  mount -o "$BTRFS_OPTS,subvol=@var_log" "$ROOT_DEV" "$TARGET/var/log"
+  mount -o "$BTRFS_OPTS,subvol=@var_cache" "$ROOT_DEV" "$TARGET/var/cache"
+  mount "$(part 2)" "$TARGET/boot"
+  mkdir -p "$TARGET/boot/efi"
+  mount "$(part 1)" "$TARGET/boot/efi"
+  if [ "$FORM" = laptop ]; then
+    mkdir -p "$TARGET/swap"
+    mount -o "noatime,subvol=@swap" "$ROOT_DEV" "$TARGET/swap"
+    # Half the memory, 2 to 8 GiB, never more than 5 % of the disk. zram
+    # handles everyday pressure; the file is the safety net.
+    local ram_g disk_g
+    ram_g=$(( ($(awk '/MemTotal/ {print $2}' /proc/meminfo) + 1048575) / 1048576 ))
+    disk_g=$(( $(lsblk -dbno SIZE "$DISK") / 1024 / 1024 / 1024 ))
+    SWAP_G=$(( ram_g / 2 )); [ "$SWAP_G" -ge 2 ] || SWAP_G=2; [ "$SWAP_G" -le 8 ] || SWAP_G=8
+    [ "$SWAP_G" -le $(( disk_g / 20 )) ] || SWAP_G=$(( disk_g / 20 ))
+    if [ "$SWAP_G" -ge 1 ]; then
+      quiet btrfs filesystem mkswapfile --size "${SWAP_G}G" "$TARGET/swap/swapfile"
+      ok "swap file ${SWAP_G} GiB"
+    fi
+  fi
+  ok '@ @home @snapshots @var_log @var_cache'"$( [ "$FORM" = laptop ] && printf ' @swap')"
+}
+
+uuid() { blkid -s UUID -o value "$1"; }
+
+write_fstab() {
+  local ru bu eu
+  ru=$(uuid "$ROOT_DEV"); bu=$(uuid "$(part 2)"); eu=$(uuid "$(part 1)")
+  {
+    echo "# Written by niruboot $VERSION"
+    echo "UUID=$ru  /            btrfs  $BTRFS_OPTS,subvol=@           0 0"
+    echo "UUID=$ru  /home        btrfs  $BTRFS_OPTS,subvol=@home       0 0"
+    echo "UUID=$ru  /.snapshots  btrfs  $BTRFS_OPTS,subvol=@snapshots  0 0"
+    echo "UUID=$ru  /var/log     btrfs  $BTRFS_OPTS,subvol=@var_log    0 0"
+    echo "UUID=$ru  /var/cache   btrfs  $BTRFS_OPTS,subvol=@var_cache  0 0"
+    echo "UUID=$bu  /boot        ext4   defaults,noatime               0 2"
+    echo "UUID=$eu  /boot/efi    vfat   umask=0077,noatime             0 2"
+    if [ "$FORM" = laptop ] && [ "$SWAP_G" -ge 1 ]; then
+      echo "UUID=$ru  /swap        btrfs  noatime,subvol=@swap           0 0"
+      echo "/swap/swapfile  none  swap  defaults,pri=10  0 0"
+    fi
+    echo "tmpfs  /tmp  tmpfs  defaults,nosuid,nodev,mode=1777  0 0"
+  } > "$TARGET/etc/fstab"
+}
+
+# ---- hardware ----------------------------------------------------------------
+
+CPU_VENDOR=
+GPU_VENDORS=
+hardware() {
+  grep -q GenuineIntel /proc/cpuinfo && CPU_VENDOR=intel
+  grep -q AuthenticAMD /proc/cpuinfo && CPU_VENDOR=amd
+  local d v
+  for d in /sys/class/drm/card[0-9]; do
+    [ -r "$d/device/vendor" ] || continue
+    v=$(cat "$d/device/vendor")
+    case "$v" in 0x8086) GPU_VENDORS="$GPU_VENDORS intel" ;; 0x1002) GPU_VENDORS="$GPU_VENDORS amd" ;; 0x10de) GPU_VENDORS="$GPU_VENDORS nvidia" ;; esac
+  done
+  say "CPU: ${CPU_VENDOR:-unknown} · graphics:${GPU_VENDORS:- unknown}"
+}
+has_gpu() { case " $GPU_VENDORS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# ---- chroot helpers ----------------------------------------------------------
+
+bind_mounts() {
+  local m
+  for m in dev dev/pts proc sys run; do mkdir -p "$TARGET/$m"; mount --rbind "/$m" "$TARGET/$m"; mount --make-rslave "$TARGET/$m"; done
+  [ -d /sys/firmware/efi/efivars ] && mountpoint -q "$TARGET/sys/firmware/efi/efivars" || :
+  cp -L /etc/resolv.conf "$TARGET/etc/resolv.conf" 2>/dev/null || :
+}
+in_target() {
+  chroot "$TARGET" /usr/bin/env -i HOME=/root TERM=xterm PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C \
+    DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true "$@"
+}
+
+# ---- Void --------------------------------------------------------------------
+
+install_void() {
+  step 'Installing Void Linux'
+  mkdir -p "$TARGET/var/db/xbps/keys" "$TARGET/etc"
+  cp -a /var/db/xbps/keys/. "$TARGET/var/db/xbps/keys/"
+  local pkgs=(base-system grub-x86_64-efi efibootmgr btrfs-progs cryptsetup dracut NetworkManager
+              sudo curl git openssh chrony zramen void-repo-nonfree linux-firmware mesa-dri vulkan-loader
+              dbus bash-completion rsync wget openssl)
+  has_gpu intel && pkgs+=(mesa-vulkan-intel intel-video-accel)
+  has_gpu amd && pkgs+=(mesa-vulkan-radeon mesa-vaapi)
+  [ "$CPU_VENDOR" = amd ] && pkgs+=(linux-firmware-amd)
+  XBPS_ARCH=x86_64 quiet xbps-install -Sy -R "$VOID_REPO" -r "$TARGET" "${pkgs[@]}"
+  ok 'base system'
+  if [ "$CPU_VENDOR" = intel ]; then
+    XBPS_ARCH=x86_64 quiet xbps-install -Sy -R "$VOID_REPO" -R "$VOID_REPO/nonfree" -r "$TARGET" intel-ucode
+    ok 'Intel microcode'
+  fi
+  write_fstab
+  bind_mounts
+  echo "$HOSTNAME_NEW" > "$TARGET/etc/hostname"
+  sed -i "s/^#\?KEYMAP=.*/KEYMAP=$KEYMAP_CONSOLE/; s/^#\?HARDWARECLOCK=.*/HARDWARECLOCK=UTC/" "$TARGET/etc/rc.conf"
+  grep -q '^KEYMAP=' "$TARGET/etc/rc.conf" || echo "KEYMAP=$KEYMAP_CONSOLE" >> "$TARGET/etc/rc.conf"
+  # dracut's i18n module reads vconsole.conf: the disk password prompt in the
+  # initramfs then uses the Swedish layout too.
+  printf 'KEYMAP=%s\n' "$KEYMAP_CONSOLE" > "$TARGET/etc/vconsole.conf"
+  ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$TARGET/etc/localtime"
+  sed -i "s/^#\s*\($LOCALE UTF-8\)/\1/" "$TARGET/etc/default/libc-locales"
+  echo "LANG=$LOCALE" > "$TARGET/etc/locale.conf"
+  quiet in_target xbps-reconfigure -f glibc-locales
+  local sv
+  # A serial console (VMs, servers, the tests) gets a login prompt too.
+  case " $EXTRA_CMDLINE " in *console=ttyS0*) ln -sf /etc/sv/agetty-ttyS0 "$TARGET/etc/runit/runsvdir/default/agetty-ttyS0" ;; esac
+  for sv in dbus NetworkManager sshd chronyd zramen; do
+    [ -d "$TARGET/etc/sv/$sv" ] && ln -sf "/etc/sv/$sv" "$TARGET/etc/runit/runsvdir/default/$sv"
+  done
+  # NetworkManager owns the network; dhcpcd and wpa_supplicant would fight it.
+  rm -f "$TARGET/etc/runit/runsvdir/default/dhcpcd" "$TARGET/etc/runit/runsvdir/default/wpa_supplicant"
+  {
+    echo 'hostonly="yes"'
+    echo 'add_dracutmodules+=" btrfs i18n '"$( [ "$ENCRYPT" = yes ] && echo crypt)"' "'
+  } > "$TARGET/etc/dracut.conf.d/10-niruboot.conf"
+  printf 'ZRAM_SIZE=50\n' > "$TARGET/etc/zramen.conf" 2>/dev/null || :
+  common_system
+  grub_install void
+  quiet in_target xbps-reconfigure -fa
+  ok 'kernel, initramfs and boot loader'
+}
+
+# ---- Arch --------------------------------------------------------------------
+
+install_arch() {
+  step 'Installing Arch Linux'
+  local pkgs=(base linux linux-firmware btrfs-progs cryptsetup grub efibootmgr networkmanager sudo
+              curl git openssh zram-generator mesa vulkan-icd-loader bash-completion rsync wget man-db)
+  [ "$CPU_VENDOR" = intel ] && pkgs+=(intel-ucode)
+  [ "$CPU_VENDOR" = amd ] && pkgs+=(amd-ucode)
+  has_gpu intel && pkgs+=(vulkan-intel intel-media-driver)
+  has_gpu amd && pkgs+=(vulkan-radeon libva-mesa-driver)
+  quiet pacman-key --init 2>/dev/null || :
+  quiet pacman-key --populate archlinux 2>/dev/null || :
+  quiet pacstrap -K "$TARGET" "${pkgs[@]}"
+  ok 'base system'
+  write_fstab
+  bind_mounts
+  echo "$HOSTNAME_NEW" > "$TARGET/etc/hostname"
+  ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$TARGET/etc/localtime"
+  quiet in_target hwclock --systohc || :
+  sed -i "s/^#\($LOCALE UTF-8\)/\1/" "$TARGET/etc/locale.gen"
+  quiet in_target locale-gen
+  echo "LANG=$LOCALE" > "$TARGET/etc/locale.conf"
+  printf 'KEYMAP=%s\n' "$KEYMAP_CONSOLE" > "$TARGET/etc/vconsole.conf"
+  # The keymap hook comes before encrypt, so the disk password is typed with
+  # the Swedish layout.
+  local hooks='base udev autodetect microcode modconf kms keyboard keymap consolefont block'
+  [ "$ENCRYPT" = yes ] && hooks="$hooks encrypt"
+  hooks="$hooks filesystems fsck"
+  sed -i "s/^HOOKS=.*/HOOKS=($hooks)/" "$TARGET/etc/mkinitcpio.conf"
+  printf '[zram0]\nzram-size = min(ram / 2, 8192)\ncompression-algorithm = zstd\n' > "$TARGET/etc/systemd/zram-generator.conf"
+  common_system
+  quiet in_target mkinitcpio -P
+  grub_install arch
+  quiet in_target systemctl enable NetworkManager sshd systemd-timesyncd fstrim.timer
+  ok 'kernel, initramfs and boot loader'
+}
+
+# ---- Debian ------------------------------------------------------------------
+
+install_debian() {
+  step "Installing Debian ($DEBIAN_SUITE)"
+  quiet debootstrap --arch=amd64 --include=locales,ca-certificates "$DEBIAN_SUITE" "$TARGET" "$DEBIAN_MIRROR"
+  ok 'base system'
+  cat > "$TARGET/etc/apt/sources.list.d/debian.sources" <<EOF
+Types: deb
+URIs: $DEBIAN_MIRROR
+Suites: $DEBIAN_SUITE $DEBIAN_SUITE-updates
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.debian.org/debian-security
+Suites: $DEBIAN_SUITE-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+  rm -f "$TARGET/etc/apt/sources.list"
+  write_fstab
+  bind_mounts
+  echo "$HOSTNAME_NEW" > "$TARGET/etc/hostname"
+  printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$HOSTNAME_NEW" > "$TARGET/etc/hosts"
+  ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$TARGET/etc/localtime"
+  echo "$TIMEZONE" > "$TARGET/etc/timezone"
+  sed -i "s/^# *\($LOCALE UTF-8\)/\1/" "$TARGET/etc/locale.gen"
+  quiet in_target locale-gen
+  echo "LANG=$LOCALE" > "$TARGET/etc/default/locale"
+  cat > "$TARGET/etc/default/keyboard" <<EOF
+XKBMODEL="pc105"
+XKBLAYOUT="$XKB_LAYOUT"
+XKBVARIANT=""
+XKBOPTIONS=""
+BACKSPACE="guess"
+EOF
+  if [ "$ENCRYPT" = yes ]; then
+    echo "$MAPPER UUID=$(uuid "$(part 3)") none luks,discard" > "$TARGET/etc/crypttab"
+  fi
+  local pkgs=(linux-image-amd64 grub-efi-amd64 efibootmgr btrfs-progs network-manager sudo curl git
+              openssh-server console-setup keyboard-configuration firmware-linux systemd-timesyncd
+              systemd-zram-generator mesa-vulkan-drivers mesa-va-drivers bash-completion rsync wget
+              man-db dbus initramfs-tools openssl)
+  [ "$ENCRYPT" = yes ] && pkgs+=(cryptsetup cryptsetup-initramfs)
+  [ "$CPU_VENDOR" = intel ] && pkgs+=(intel-microcode)
+  [ "$CPU_VENDOR" = amd ] && pkgs+=(amd64-microcode)
+  has_gpu intel && pkgs+=(intel-media-va-driver-non-free)
+  [ "$FORM" = laptop ] && pkgs+=(firmware-iwlwifi firmware-realtek firmware-atheros)
+  quiet in_target apt-get update
+  quiet in_target apt-get install -y --no-install-recommends "${pkgs[@]}"
+  ok 'kernel, firmware and tools'
+  printf '[zram0]\nzram-size = min(ram / 2, 8192)\ncompression-algorithm = zstd\n' > "$TARGET/etc/systemd/zram-generator.conf"
+  # The console keymap in the initramfs: the disk password is typed with the
+  # Swedish layout.
+  sed -i 's/^#\?KEYMAP=.*/KEYMAP=y/' "$TARGET/etc/initramfs-tools/initramfs.conf"
+  quiet in_target setupcon --save-only || :
+  common_system
+  quiet in_target update-initramfs -u -k all
+  grub_install debian
+  quiet in_target systemctl enable NetworkManager ssh systemd-timesyncd fstrim.timer
+  ok 'initramfs and boot loader'
+}
+
+# ---- common ------------------------------------------------------------------
+
+common_system() {
+  # The keyboard in X before any desktop sets it (NIRUX keeps it).
+  mkdir -p "$TARGET/etc/X11/xorg.conf.d"
+  cat > "$TARGET/etc/X11/xorg.conf.d/00-keyboard.conf" <<EOF
+Section "InputClass"
+    Identifier "system-keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout" "$XKB_LAYOUT"
+EndSection
+EOF
+  # The user, sudo for the wheel group, root locked.
+  in_target sh -c 'getent group wheel >/dev/null || groupadd -r wheel'
+  local groups=wheel g
+  for g in audio video input network plugdev lp storage scanner bluetooth; do
+    in_target getent group "$g" >/dev/null 2>&1 && groups="$groups,$g"
+  done
+  quiet in_target useradd -m -G "$groups" -s /bin/bash "$USERNAME"
+  set_password "$USERNAME" "$PASSWORD"
+  in_target passwd -l root >/dev/null 2>&1 || :
+  mkdir -p "$TARGET/etc/sudoers.d"
+  echo '%wheel ALL=(ALL:ALL) ALL' > "$TARGET/etc/sudoers.d/10-wheel"
+  chmod 440 "$TARGET/etc/sudoers.d/10-wheel"
+  ok "user $USERNAME with sudo"
+  # The installation's Wi-Fi network, so the first boot is online.
+  if [ -n "$WIFI_SSID" ]; then
+    local f="$TARGET/etc/NetworkManager/system-connections/niruboot-wifi.nmconnection"
+    mkdir -p "${f%/*}"
+    (umask 077; cat > "$f" <<EOF
+[connection]
+id=$WIFI_SSID
+type=wifi
+autoconnect=true
+
+[wifi]
+mode=infrastructure
+ssid=$WIFI_SSID
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=$WIFI_PSK
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+EOF
+    )
+    [ -n "$WIFI_PSK" ] || sed -i '/^\[wifi-security\]/,/^psk=/d' "$f"
+    chmod 600 "$f"
+    ok "Wi-Fi $WIFI_SSID saved"
+  fi
+  # The next step, one command away.
+  local home="$TARGET/home/$USERNAME"
+  cat > "$home/install-nirux" <<EOF
+#!/bin/sh
+# Written by niruboot: installs the NIRUX desktop. Run it as $USERNAME.
+set -e
+command -v git >/dev/null || { echo "git is missing"; exit 1; }
+mkdir -p "\$HOME/Git"
+if [ -d "\$HOME/Git/nirux/.git" ]; then git -C "\$HOME/Git/nirux" pull --ff-only
+else git clone $NIRUX_REPO "\$HOME/Git/nirux"; fi
+cd "\$HOME/Git/nirux"
+exec ./nirux install "\$@"
+EOF
+  chmod 755 "$home/install-nirux"
+  cat >> "$home/.bash_profile" <<'EOF'
+# niruboot: a hint until NIRUX is installed.
+if [ ! -x "$HOME/.local/bin/nirux" ] && [ -x "$HOME/install-nirux" ]; then
+  printf '\nThis computer is ready for NIRUX. Install it with:\n  ~/install-nirux\n\n'
+fi
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+EOF
+  in_target chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
+  cp "$LOG" "$TARGET/var/log/niruboot.log" 2>/dev/null || :
+}
+
+# Set a password and make sure it took. Void's chpasswd goes through a PAM
+# stack that only permits (pam_permit) and leaves the account locked while
+# reporting success, so the SHA-512 hash is made here and written with
+# chpasswd -e, then the shadow entry is checked.
+set_password() {
+  local user=$1 pw=$2 hash=
+  if in_target sh -c 'command -v openssl' >/dev/null 2>&1; then
+    hash=$(printf '%s' "$pw" | in_target openssl passwd -6 -stdin)
+  elif command -v openssl >/dev/null 2>&1; then
+    hash=$(printf '%s' "$pw" | openssl passwd -6 -stdin)
+  fi
+  if [ -n "$hash" ]; then
+    printf '%s:%s\n' "$user" "$hash" | in_target chpasswd -e
+  else
+    printf '%s:%s\n' "$user" "$pw" | in_target chpasswd
+  fi
+  local field
+  field=$(awk -F: -v u="$user" '$1 == u {print $2}' "$TARGET/etc/shadow")
+  case "$field" in
+    '$'*) ;;
+    *) die "the password of $user could not be set" ;;
+  esac
+}
+
+grub_install() {
+  local id=$1 cmdline
+  cmdline="rootflags=subvol=@ loglevel=4 $EXTRA_CMDLINE"
+  if [ "$ENCRYPT" = yes ]; then
+    local lu; lu=$(uuid "$(part 3)")
+    case "$id" in
+      void) cmdline="rd.luks.uuid=$lu rd.luks.allow-discards $cmdline" ;;
+      arch) cmdline="cryptdevice=UUID=$lu:$MAPPER:allow-discards root=/dev/mapper/$MAPPER $cmdline" ;;
+      debian) : ;; # crypttab and cryptsetup-initramfs
+    esac
+  fi
+  sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"$cmdline\"|" "$TARGET/etc/default/grub"
+  grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$TARGET/etc/default/grub" ||
+    echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$cmdline\"" >> "$TARGET/etc/default/grub"
+  sed -i 's/^#\?GRUB_TIMEOUT=.*/GRUB_TIMEOUT=2/' "$TARGET/etc/default/grub"
+  # A boot entry, plus the removable path that firmware always finds.
+  # NIRUBOOT_NO_NVRAM=1 (tests) never touches the firmware's own boot list.
+  if [ "${NIRUBOOT_NO_NVRAM:-0}" != 1 ]; then
+    quiet in_target grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="$id" --recheck ||
+      warn 'no firmware boot entry (the fallback path is used)'
+  fi
+  quiet in_target grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable
+  quiet in_target grub-mkconfig -o /boot/grub/grub.cfg
+}
+
+finish() {
+  step 'Finishing'
+  sync
+  umount -R "$TARGET" 2>/dev/null || :
+  [ "$ENCRYPT" != yes ] || cryptsetup close "$MAPPER" 2>/dev/null || :
+  say ''
+  say "${G}${B}Done.${N} $DISTRO is installed on $DISK."
+  say ''
+  say 'Next:'
+  say '  1. Remove the USB stick and restart: reboot'
+  [ "$ENCRYPT" = yes ] && say '  2. Type the disk password at start (Swedish keyboard).'
+  say "  3. Log in as $USERNAME on the text console."
+  say '  4. Install NIRUX: ~/install-nirux'
+  say ''
+  say "Log: $LOG (also in /var/log/niruboot.log on the new system, without passwords)."
+}
+
+usage() {
+  cat <<EOF
+NIRUBOOT $VERSION: install Void, Arch or Debian from its live USB, ready for NIRUX.
+
+  sudo bash niruboot            interactive (recommended)
+  niruboot --version | --help
+
+Unattended (testing): NIRUBOOT_DISK, NIRUBOOT_FORM=laptop|desktop,
+NIRUBOOT_HOSTNAME, NIRUBOOT_ENCRYPT=yes|no, NIRUBOOT_PASSWORD_FILE,
+NIRUBOOT_LUKS_PASSWORD_FILE, NIRUBOOT_YES=1. See README.md.
+EOF
+}
+
+main() {
+  case "${1:-}" in
+    --version) echo "NIRUBOOT $VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    '') ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  preflight
+  live_tools
+  network
+  hardware
+  questions
+  partition
+  subvolumes
+  case "$DISTRO" in
+    void) install_void ;;
+    arch) install_arch ;;
+    debian) install_debian ;;
+  esac
+  finish
+}
+
+main "$@"

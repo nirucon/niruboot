@@ -1,0 +1,11 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n niruboot && bash -n tests/vm-test.sh && bash -n tests/run-all.sh
+      - run: shellcheck -S warning niruboot tests/vm-test.sh tests/run-all.sh
+      - run: python3 -m py_compile tests/serial-check.py
+      - run: test "$(bash niruboot --version)" = "NIRUBOOT $(sed -n 's/^VERSION=//p' niruboot)"

@@ -20,7 +20,7 @@
 # Debian live USB. UEFI only. See README.md.
 set -Eeuo pipefail
 
-VERSION=0.1.2
+VERSION=0.1.3
 LOG=/tmp/niruboot.log
 TARGET=${NIRUBOOT_TARGET:-/mnt}
 MAPPER=cryptroot
@@ -87,7 +87,7 @@ long() { # long "what is happening" command...
   return "$rc"
 }
 elapsed() { printf '%d:%02d' $(($1 / 60)) $(($1 % 60)); }
-trap 'printf "\n%sniruboot stopped at line %s. Details: %s%s\n" "$R" "$LINENO" "$LOG" "$N" >&2' ERR
+trap 'printf "\n%sniruboot stopped at line %s (%s). Details: %s%s\n" "$R" "$LINENO" "$BASH_COMMAND" "$LOG" "$N" >&2' ERR
 
 ask() { # ask VAR "Question" default
   local answer
@@ -358,29 +358,36 @@ cable_connect() {
 # wpa_supplicant (Void live). If only the name is found, ask for the password.
 remember_wifi() {
   [ -z "$WIFI_SSID" ] || return 0
-  local con ifc cfg f
+  local con ifc cfg f pid
   ifc=$(wifi_iface || true)
   [ -n "$ifc" ] || return 0
   if command -v nmcli >/dev/null 2>&1 && nmcli general status >/dev/null 2>&1; then
-    con=$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | awk -F: '$2 == "802-11-wireless" {print $1; exit}')
+    con=$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | awk -F: '$2 == "802-11-wireless" {print $1; exit}' || true)
     if [ -n "$con" ]; then
       WIFI_SSID=$(nmcli -s -g 802-11-wireless.ssid connection show "$con" 2>/dev/null || true)
       WIFI_PSK=$(nmcli -s -g 802-11-wireless-security.psk connection show "$con" 2>/dev/null || true)
     fi
   fi
   if [ -z "$WIFI_SSID" ] && command -v iwctl >/dev/null 2>&1; then
-    WIFI_SSID=$(iwctl station "$ifc" show 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '$1 == "Connected" && $2 == "network" {$1 = $2 = ""; sub(/^ +/, ""); sub(/ +$/, ""); print; exit}')
+    WIFI_SSID=$(iwctl station "$ifc" show 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '$1 == "Connected" && $2 == "network" {$1 = $2 = ""; sub(/^ +/, ""); sub(/ +$/, ""); print; exit}' || true)
     f="/var/lib/iwd/$WIFI_SSID.psk"
     if [ -n "$WIFI_SSID" ] && [ -r "$f" ]; then
-      WIFI_PSK=$(sed -n 's/^Passphrase=//p' "$f" | head -n 1)
-      [ -n "$WIFI_PSK" ] || WIFI_PSK=$(sed -n 's/^PreSharedKey=//p' "$f" | head -n 1)
+      WIFI_PSK=$(sed -n 's/^Passphrase=//p' "$f" | head -n 1 || true)
+      [ -n "$WIFI_PSK" ] || WIFI_PSK=$(sed -n 's/^PreSharedKey=//p' "$f" | head -n 1 || true)
     fi
   fi
   if [ -z "$WIFI_SSID" ] && command -v wpa_cli >/dev/null 2>&1; then
-    WIFI_SSID=$(wpa_cli -i "$ifc" status 2>/dev/null | sed -n 's/^ssid=//p' | head -n 1)
-    cfg=$(tr '\0' ' ' < "/proc/$(pgrep -f "wpa_supplicant.*$ifc" | head -n 1)/cmdline" 2>/dev/null | grep -o -- '-c *[^ ]*' | head -n 1 | sed 's/^-c *//')
+    WIFI_SSID=$(wpa_cli -i "$ifc" status 2>/dev/null | sed -n 's/^ssid=//p' | head -n 1 || true)
+    # The configuration file wpa_supplicant was started with (-c FILE or
+    # -cFILE). Best effort: no process, no -c (started by NetworkManager or
+    # with -C) or an unreadable file only means the password is asked for.
+    pid=$(pgrep -f "wpa_supplicant.*$ifc" 2>/dev/null | head -n 1 || true)
+    cfg=
+    if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ]; then
+      cfg=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | awk 'take { print; exit } $0 == "-c" { take = 1; next } /^-c./ { sub(/^-c/, ""); print; exit }' || true)
+    fi
     if [ -n "$WIFI_SSID" ] && [ -r "$cfg" ]; then
-      WIFI_PSK=$(awk -v s="\"$WIFI_SSID\"" '/^[[:space:]]*ssid=/ {split($0, a, "="); cur = (a[2] == s)} cur && /^[[:space:]]*psk=/ {sub(/^[[:space:]]*psk=/, ""); gsub(/"/, ""); print; exit}' "$cfg")
+      WIFI_PSK=$(awk -v s="\"$WIFI_SSID\"" '/^[[:space:]]*ssid=/ {split($0, a, "="); cur = (a[2] == s)} cur && /^[[:space:]]*psk=/ {sub(/^[[:space:]]*psk=/, ""); gsub(/"/, ""); print; exit}' "$cfg" || true)
     fi
   fi
   [ -n "$WIFI_SSID" ] || return 0

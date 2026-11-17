@@ -20,7 +20,7 @@
 # Debian live USB. UEFI only. See README.md.
 set -Eeuo pipefail
 
-VERSION=0.1.3
+VERSION=0.1.4
 LOG=/tmp/niruboot.log
 TARGET=${NIRUBOOT_TARGET:-/mnt}
 MAPPER=cryptroot
@@ -124,6 +124,34 @@ detect_distro() {
     *) case " $like " in *" arch "*) DISTRO=arch ;; *" debian "*) DISTRO=debian ;; esac ;;
   esac
   [ -n "$DISTRO" ] || die "run this from the Void, Arch or Debian live USB (this is: ${id:-unknown})"
+}
+
+# The passwords are typed here, in the live system, but used later with a
+# Swedish keyboard (the disk prompt, the console, X). A live system with a US
+# layout turns Shift+. into ">" instead of ":", so a password would not match
+# at the first start. Switch the live keyboard to Swedish first, then let the
+# user prove it by typing two characters that differ between the layouts.
+live_keyboard() {
+  local tty disp xauth home typed
+  tty=$(tty 2>/dev/null || true)
+  case "$tty" in /dev/tty[0-9]*) loadkeys "$KEYMAP_CONSOLE" >> "$LOG" 2>&1 || true ;; esac
+  if command -v setxkbmap >/dev/null 2>&1; then
+    disp=${DISPLAY:-}
+    home=$(getent passwd "${SUDO_USER:-root}" 2>/dev/null | cut -d: -f6 || true)
+    xauth=${XAUTHORITY:-${home:+$home/.Xauthority}}
+    [ -n "$disp" ] || { [ -S /tmp/.X11-unix/X0 ] && disp=:0; }
+    [ -z "$disp" ] || DISPLAY=$disp XAUTHORITY=$xauth setxkbmap "$XKB_LAYOUT" >> "$LOG" 2>&1 || true
+  fi
+  [ "$ASSUME_YES" != 1 ] || return 0
+  while :; do
+    read -r -p 'Keyboard check: type a colon and an at sign, :@ and press Enter: ' typed < /dev/tty || typed=
+    [ "$typed" = ':@' ] && { ok 'Swedish keyboard'; return 0; }
+    [ "$typed" = skip ] && { warn 'going on without a checked keyboard'; return 0; }
+    warn "that came out as \"$typed\": this keyboard is not Swedish here, so passwords typed now would not work at the first start."
+    say  '  In a text console:  loadkeys sv-latin1'
+    say  '  In a desktop:       setxkbmap se   (or switch the layout in the panel)'
+    say  '  Then try again here. Type skip to go on anyway (avoid : @ < > and å ä ö in passwords).'
+  done
 }
 
 preflight() {
@@ -924,6 +952,7 @@ main() {
     *) usage >&2; exit 2 ;;
   esac
   preflight
+  live_keyboard
   network
   live_tools
   hardware

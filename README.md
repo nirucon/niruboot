@@ -102,7 +102,14 @@ address. On the Arch ISO you are root already, so `bash niruboot` is enough.
 On Void live, the user is `anon` and the password (also for sudo) is
 `voidlinux`.
 
-It asks:
+It first switches the live system to the Swedish keyboard and asks you to type
+`:@` as a check. The passwords are typed here but used later with a Swedish
+keyboard, so a live system still on a US layout would store `>` where you
+typed `:`, and the password would not work at the first start. If the check
+fails, run `loadkeys sv-latin1` (text console) or `setxkbmap se` (desktop) and
+try again.
+
+Then it asks:
 
 1. **Disk:** pick it from the list (number or `/dev/NAME`).
 2. **Laptop or desktop:** laptop is the default (adds a swap file and suggests

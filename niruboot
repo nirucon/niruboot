@@ -20,7 +20,7 @@
 # Debian live USB. UEFI only. See README.md.
 set -Eeuo pipefail
 
-VERSION=0.1.4
+VERSION=0.1.5
 LOG=/tmp/niruboot.log
 TARGET=${NIRUBOOT_TARGET:-/mnt}
 MAPPER=cryptroot
@@ -886,7 +886,9 @@ set_password() {
 
 grub_install() {
   local id=$1 cmdline
-  cmdline="rootflags=subvol=@ loglevel=4 $EXTRA_CMDLINE"
+  # GRUB adds rootflags=subvol=@ itself for a btrfs subvolume root; it is
+  # only added here when the generated configuration lacks it (below).
+  cmdline="loglevel=4 $EXTRA_CMDLINE"
   if [ "$ENCRYPT" = yes ]; then
     local lu; lu=$(uuid "$(part 3)")
     case "$id" in
@@ -907,6 +909,13 @@ grub_install() {
   fi
   quiet in_target grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable
   quiet in_target grub-mkconfig -o /boot/grub/grub.cfg
+  if ! grep -Eq '^[[:space:]]*linux[[:space:]].*rootflags=subvol=@' "$TARGET/boot/grub/grub.cfg"; then
+    cmdline="rootflags=subvol=@ $cmdline"
+    sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"$cmdline\"|" "$TARGET/etc/default/grub"
+    quiet in_target grub-mkconfig -o /boot/grub/grub.cfg
+  fi
+  grep -Eq '^[[:space:]]*linux[[:space:]].*rootflags=subvol=@' "$TARGET/boot/grub/grub.cfg" ||
+    die 'the boot configuration does not name the root subvolume'
 }
 
 finish() {

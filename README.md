@@ -31,6 +31,11 @@ want: `~/install-nirux` installs NIRUX with one command.
 - **User:** `niru` with sudo (group wheel); root is locked.
 - **Network:** the Wi-Fi network you used for the installation is saved, so
   the first start is online.
+- **The NIRUX boot look:** the GRUB menu in the NIRUX style with every kernel
+  in it, and the disk password asked on the NIRUX boot splash, made by
+  [NIRUSPLASH](https://github.com/nirucon/nirusplash). If it cannot be made,
+  the plain boot is kept and the install goes on. `NIRUBOOT_SPLASH=no` leaves
+  it out.
 - **Next step:** `~/install-nirux` clones NIRUX and runs `./nirux install`.
 
 ## Requirements
@@ -129,7 +134,8 @@ reboot
 ```
 
 Remove the stick. Type the disk password if you chose encryption (Swedish
-keyboard), log in as `niru` on the text console and run:
+keyboard) at `$ unlock disk` on the NIRUX splash (Esc shows the plain text
+prompt), log in as `niru` on the text console and run:
 
 ```sh
 ~/install-nirux
@@ -168,12 +174,19 @@ Every answer can come from the environment: `NIRUBOOT_DISK`,
 `NIRUBOOT_FORM=laptop|desktop`, `NIRUBOOT_HOSTNAME`, `NIRUBOOT_ENCRYPT=yes|no`,
 `NIRUBOOT_PASSWORD_FILE` and `NIRUBOOT_LUKS_PASSWORD_FILE` (passwords only
 from files), and `NIRUBOOT_YES=1` to skip the confirmation.
+`NIRUBOOT_SPLASH=no` skips the boot look, `NIRUBOOT_SCREEN=WIDTHxHEIGHT` sets
+the screen it is made for, and `NIRUBOOT_NIRUSPLASH_FILE` uses a local
+nirusplash instead of the latest release.
 
 `tests/vm-test.sh void|arch|debian yes|no [laptop|desktop]` installs into a
 32 GiB disk image from a container of the distribution, starts it in QEMU with
 UEFI firmware and checks the result over the serial console: login, sudo,
 btrfs layout, encryption, swap, network and `~/install-nirux`. It needs root,
 docker, QEMU, OVMF and KVM, and never touches the host's firmware boot list.
+`NIRUBOOT_TEST_SPLASH=path/to/nirusplash` also installs the boot look, takes
+screenshots of the GRUB menu and the splash (`/var/tmp/niruboot-shots`), types
+the disk password on the splash with the Swedish keyboard, and checks that
+`nirusplash doctor` passes and that the splash has quit before the login.
 `tests/run-all.sh yes|no laptop|desktop void arch debian` runs several at once;
 run encrypted tests one distribution at a time (they share the host's
 `cryptroot` device name).

@@ -3,8 +3,11 @@
 
     serial-check.py SOCKET PASSWORD yes|no laptop|desktop DISTRO
 """
+import json
+import os
 import socket
 import sys
+import threading
 import time
 
 sock_path, password, encrypt, form, distro = sys.argv[1:6]
@@ -63,7 +66,170 @@ def read_any(tokens, limit):
     raise SystemExit(f"\nFAIL: none of {tokens} within {limit} s")
 
 
-if encrypt == "yes":
+# ---- the graphical boot (NIRUBOOT_QMP): screenshots, password on the splash --
+QMP = os.environ.get("NIRUBOOT_QMP")
+SHOTS = os.environ.get("NIRUBOOT_SHOTS", "/var/tmp/niruboot-shots")
+qmp_lock = threading.Lock()
+qf = None
+
+
+def qmp(cmd, **args):
+    with qmp_lock:
+        qf.write(json.dumps({"execute": cmd, "arguments": args} if args else {"execute": cmd}) + "\n")
+        qf.flush()
+        while True:
+            r = json.loads(qf.readline())
+            if "return" in r or "error" in r:
+                return r
+
+
+def grab(name):
+    path = f"{SHOTS}/{name}.ppm"
+    qmp("screendump", filename=path)
+    for _ in range(20):
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            break
+        time.sleep(0.05)
+    time.sleep(0.1)
+    return path
+
+
+def ppm(path):
+    """(width, height, rgb bytes) of a binary PPM."""
+    data = open(path, "rb").read()
+    parts, i = [], 0
+    while len(parts) < 4:
+        while data[i:i + 1].isspace():
+            i += 1
+        j = i
+        while not data[j:j + 1].isspace():
+            j += 1
+        parts.append(data[i:j])
+        i = j
+    return int(parts[1]), int(parts[2]), data[i + 1:]
+
+
+# The NIRUX background (Noir); the plain GRUB menu and console are black.
+NIRUX_BG = (0x0f, 0x0f, 0x10)
+
+
+def bands(path):
+    """Which parts of the screen have something other than the background:
+    (banner area, prompt band, bottom), as counts of lit pixels; all zero
+    when the background is not the NIRUX one."""
+    w, h, px = ppm(path)
+    bg = px[(w * 2 + 2) * 3:(w * 2 + 2) * 3 + 3]
+    if any(abs(a - b) > 3 for a, b in zip(bg, NIRUX_BG)):
+        return 0, 0, 0
+    def lit(y0, y1):
+        n = 0
+        for y in range(int(y0 * h), int(y1 * h), 2):
+            row = px[y * w * 3:(y + 1) * w * 3]
+            for x in range(0, w * 3, 12):
+                if abs(row[x] - bg[0]) + abs(row[x + 1] - bg[1]) + abs(row[x + 2] - bg[2]) > 60:
+                    n += 1
+        return n
+    return lit(0.15, 0.45), lit(0.55, 0.75), lit(0.86, 1.0)
+
+
+# US key positions for the characters as the Swedish keymap (sv-latin1) in
+# the initramfs turns them back into: "-" is on the US "/" key.
+SV_KEYS = {"-": ("slash", False), " ": ("spc", False)}
+
+
+def type_qmp(text):
+    for ch in text:
+        if ch in SV_KEYS:
+            code, shift = SV_KEYS[ch]
+        elif ch.isdigit() or ch.islower():
+            code, shift = ch, False
+        elif ch.isupper():
+            code, shift = ch.lower(), True
+        else:
+            raise SystemExit(f"FAIL: no key for {ch!r}")
+        keys = ([{"type": "qcode", "data": "shift"}] if shift else []) + [{"type": "qcode", "data": code}]
+        qmp("send-key", keys=keys, **{"hold-time": 60})
+        time.sleep(0.12)
+
+
+if QMP:
+    os.makedirs(SHOTS, exist_ok=True)
+    q = socket.socket(socket.AF_UNIX)
+    for _ in range(100):
+        try:
+            q.connect(QMP)
+            break
+        except OSError:
+            time.sleep(0.2)
+    qf = q.makefile("rw")
+    qf.readline()
+    qmp("qmp_capabilities")
+    t0 = time.time()
+    seen_menu = False
+    menu_at = None
+    prompt_at = None
+    n = 0
+    while time.time() - t0 < 180:
+        n += 1
+        shot = grab(f"frame-{n:03d}")
+        banner, band, bottom = bands(shot)
+        # The menu: the banner (many lit pixels, not just a frame's edges)
+        # and the key hints at the bottom.
+        if banner > 800 and bottom > 5 and not seen_menu:
+            seen_menu = True
+            menu_at = time.time()
+            # Stop the countdown, picture the menu, start the first entry.
+            qmp("send-key", keys=[{"type": "qcode", "data": "up"}])
+            time.sleep(0.6)
+            os.replace(grab("x"), f"{SHOTS}/1-grub.ppm")
+            os.remove(shot)
+            print("\n[splash-test] GRUB menu in the NIRUX look", flush=True)
+            qmp("send-key", keys=[{"type": "qcode", "data": "ret"}])
+            time.sleep(0.3)
+            os.replace(grab("x"), f"{SHOTS}/1b-booting.ppm")
+            continue
+        if seen_menu and banner > 800 and band > 5 and bottom == 0 and encrypt == "yes":
+            prompt_at = time.time()
+            os.replace(shot, f"{SHOTS}/2-prompt.ppm")
+            print("[splash-test] password prompt on the splash", flush=True)
+            break
+        # A splash the screenshot cannot read (a VM without its display
+        # driver in a host-only initramfs shows it through the firmware's
+        # framebuffer, which QEMU dumps garbled): type the password anyway
+        # once the splash has had time to ask; the unlock and login decide.
+        if seen_menu and encrypt == "yes" and menu_at and time.time() - menu_at > 45:
+            os.replace(shot, f"{SHOTS}/2-prompt-unreadable.ppm")
+            print("[splash-test] the splash screenshot is unreadable; typing the password on it anyway", flush=True)
+            prompt_at = time.time()
+            break
+        if banner > 800 and encrypt != "yes" and seen_menu and bottom == 0:
+            os.replace(shot, f"{SHOTS}/2-splash.ppm")
+            print("[splash-test] splash", flush=True)
+            break
+        # Keep a picture every few seconds, to see what happened on a failure.
+        if n % 8 == 0:
+            os.replace(shot, f"{SHOTS}/t-{int(time.time() - t0):03d}.ppm")
+        else:
+            os.remove(shot)
+        time.sleep(0.4)
+    splash_fail = None
+    if not seen_menu:
+        splash_fail = "no GRUB menu in the NIRUX look was seen"
+        print(f"\n[splash-test] FAIL: {splash_fail}; unlocking over the serial line to read the log", flush=True)
+        if encrypt == "yes":
+            # Without the splash the prompt is text on the serial line.
+            send(password + "\r")
+    elif encrypt == "yes":
+        if prompt_at is None:
+            raise SystemExit("FAIL: no password prompt on the splash was seen")
+        time.sleep(1)
+        type_qmp(password)
+        time.sleep(0.5)
+        os.replace(grab("x"), f"{SHOTS}/3-typed.ppm")
+        qmp("send-key", keys=[{"type": "qcode", "data": "ret"}])
+        time.sleep(0.4)
+        os.replace(grab("x"), f"{SHOTS}/4-unlocking.ppm")
+elif encrypt == "yes":
     # Void and Arch ask for the "passphrase", Debian to "unlock disk".
     read_any(["assphrase", "unlock disk"], 180)
     time.sleep(1)
@@ -87,6 +253,9 @@ checks = (
     "echo CHK-LANG $LANG; "
     "echo CHK-ENC $(lsblk -no TYPE | grep -c crypt); "
     "echo CHK-ROOTLOCK $(sudo -S -p '' passwd -S root </dev/null 2>/dev/null | awk '{print $2}'); "
+    "for i in $(seq 30); do pgrep -x plymouthd >/dev/null || break; sleep 1; done; "
+    "echo CHK-PLYQUIT $(pgrep -x plymouthd >/dev/null && echo running || echo gone); "
+    "echo CHK-SPLASH $(sudo -S -p '' /usr/local/sbin/nirusplash doctor </dev/null >/tmp/sd.txt 2>&1 && echo ok || echo bad) $(tr '\\n' '|' </tmp/sd.txt | tr -s ' '); "
     "echo CHK-END\r"
 )
 # The terminal echoes the command; write each key as CHK""-NAME there, so
@@ -127,6 +296,16 @@ if "en_US.UTF-8" not in val("CHK-LANG"):
     fails.append(f"LANG {val('CHK-LANG')}")
 if encrypt == "yes" and not val("CHK-ENC").startswith("1"):
     fails.append("root is not encrypted")
+if QMP and not splash_fail and val("CHK-PLYQUIT") != "gone":
+    fails.append("the splash is still running after the login (it must quit before the login screen)")
+if QMP and splash_fail:
+    send("sudo -S -p '' cat /var/log/nirusplash.log </dev/null | tail -40; echo LOG\"\"-END\r")
+    print(read_until("LOG-END", 30))
+    fails.append(splash_fail)
+if QMP and not val("CHK-SPLASH").startswith("ok"):
+    fails.append(f"nirusplash doctor: {val('CHK-SPLASH')}")
+if QMP:
+    print("\n[splash-test] doctor:", val("CHK-SPLASH"))
 # Optional: install NIRUX with ~/install-nirux, nothing else in between.
 if not fails and len(sys.argv) > 6 and sys.argv[6] == "nirux":
     send(

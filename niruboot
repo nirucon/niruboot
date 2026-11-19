@@ -20,7 +20,7 @@
 # Debian live USB. UEFI only. See README.md.
 set -Eeuo pipefail
 
-VERSION=0.1.5
+VERSION=0.1.6
 LOG=/tmp/niruboot.log
 TARGET=${NIRUBOOT_TARGET:-/mnt}
 MAPPER=cryptroot
@@ -28,6 +28,7 @@ DEBIAN_SUITE=${NIRUBOOT_DEBIAN_SUITE:-trixie}
 DEBIAN_MIRROR=${NIRUBOOT_DEBIAN_MIRROR:-http://deb.debian.org/debian}
 VOID_REPO=${NIRUBOOT_VOID_REPO:-https://repo-default.voidlinux.org/current}
 NIRUX_REPO=https://github.com/nirucon/nirux
+NIRUSPLASH_URL=https://github.com/nirucon/nirusplash/releases/latest/download
 
 # Answers. Every one can be given in the environment for unattended use and
 # testing (the passwords through files, never on the command line).
@@ -42,6 +43,7 @@ XKB_LAYOUT=se
 LOCALE=en_US.UTF-8
 ASSUME_YES=${NIRUBOOT_YES:-0}
 EXTRA_CMDLINE=${NIRUBOOT_EXTRA_CMDLINE:-}
+SPLASH=${NIRUBOOT_SPLASH:-yes}       # yes | no: the NIRUX boot look (nirusplash)
 PASSWORD=
 LUKS_PASSWORD=
 WIFI_SSID=
@@ -918,6 +920,34 @@ grub_install() {
     die 'the boot configuration does not name the root subvolume'
 }
 
+# ---- the NIRUX boot look -------------------------------------------------------
+
+# GRUB in the NIRUX look and the disk password asked on the NIRUX boot splash,
+# made by nirusplash (github.com/nirucon/nirusplash). NIRUX keeps it up to date
+# later. A failure here never stops the install: the plain boot is kept.
+boot_look() {
+  [ "$SPLASH" = yes ] || return 0
+  step 'The NIRUX boot look'
+  local d
+  d=$(mktemp -d)
+  if [ -n "${NIRUBOOT_NIRUSPLASH_FILE:-}" ]; then
+    cp "$NIRUBOOT_NIRUSPLASH_FILE" "$d/nirusplash"
+  elif ! { curl -fsSL --retry 3 --max-time 120 -o "$d/nirusplash" "$NIRUSPLASH_URL/nirusplash" &&
+           curl -fsSL --retry 3 --max-time 30 -o "$d/SHA256SUMS" "$NIRUSPLASH_URL/SHA256SUMS" &&
+           (cd "$d" && grep ' nirusplash$' SHA256SUMS | sha256sum -c --quiet -); } >> "$LOG" 2>&1; then
+    warn 'nirusplash could not be downloaded; the plain boot is kept (NIRUX adds the look later)'
+    rm -rf "$d"
+    return 0
+  fi
+  install -D -m 755 "$d/nirusplash" "$TARGET/usr/local/sbin/nirusplash"
+  rm -rf "$d"
+  if long 'GRUB theme and boot splash' in_target /usr/local/sbin/nirusplash install ${NIRUBOOT_SCREEN:+--size "$NIRUBOOT_SCREEN"}; then
+    ok 'GRUB menu and disk password in the NIRUX look'
+  else
+    warn 'the NIRUX boot look could not be made; the plain boot is kept (see /var/log/nirusplash.log)'
+  fi
+}
+
 finish() {
   step 'Finishing'
   sync
@@ -973,6 +1003,7 @@ main() {
     arch) install_arch ;;
     debian) install_debian ;;
   esac
+  boot_look
   finish
 }
 

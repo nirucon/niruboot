@@ -9,6 +9,8 @@
 #   NIRUBOOT_TEST_SPLASH=FILE installs the nirusplash at FILE (the NIRUX boot
 #   look), types the disk password on the graphical splash and saves
 #   screenshots in $SHOTS (default /var/tmp/niruboot-shots/DISTRO).
+#   NIRUBOOT_TEST_SLEEP=FILE sets up the nirusleep at FILE in the running
+#   machine, hibernates it, starts it again and checks that it resumed.
 #
 # The firmware boot list of the machine running the test is never touched
 # (NIRUBOOT_NO_NVRAM=1).
@@ -67,16 +69,34 @@ fi
 
 echo "== boot"
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$W/vars.fd"
-qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 3072 \
-  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
-  -drive if=pflash,format=raw,file="$W/vars.fd" \
-  -drive file="$IMG",format=raw,if=virtio \
-  -nic user,model=virtio-net-pci \
-  -device VGA,edid=on,xres=1280,yres=800 -qmp unix:"$W/qmp",server=on,wait=off \
-  -serial unix:"$W/serial",server=on,wait=off -display none -daemonize -pidfile "$W/qemu.pid"
+start_vm() {
+  rm -f "$W/qmp" "$W/serial"
+  qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 3072 \
+    -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+    -drive if=pflash,format=raw,file="$W/vars.fd" \
+    -drive file="$IMG",format=raw,if=virtio \
+    -nic user,model=virtio-net-pci \
+    -device VGA,edid=on,xres=1280,yres=800 -qmp unix:"$W/qmp",server=on,wait=off \
+    -serial unix:"$W/serial",server=on,wait=off -display none -daemonize -pidfile "$W/qemu.pid"
+}
+start_vm
 rc=0
 SHOTS=${SHOTS:-/var/tmp/niruboot-shots/$DISTRO}
-NIRUBOOT_QMP=${NIRUBOOT_TEST_SPLASH:+$W/qmp} NIRUBOOT_SHOTS=$SHOTS \
+# NIRUBOOT_TEST_SLEEP=FILE: nirusleep is set up and the machine hibernates;
+# serial-check exits 3, the machine is started again and must resume.
+NIRUBOOT_QMP=${NIRUBOOT_TEST_SPLASH:+$W/qmp} NIRUBOOT_SHOTS=$SHOTS NIRUBOOT_MARK_FILE=$W/mark \
 python3 "$HERE/tests/serial-check.py" "$W/serial" "$PASS" "$ENCRYPT" "$FORM" "$DISTRO" ${NIRUBOOT_TEST_NIRUX:+nirux} | tee "$W/boot.log" || rc=$?
+if [ "$rc" = 3 ]; then
+  echo "== resume"
+  i=0
+  while kill -0 "$(cat "$W/qemu.pid")" 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -gt 120 ] && { echo "FAIL: QEMU did not stop after hibernating"; exit 1; }
+    sleep 1
+  done
+  start_vm
+  rc=0
+  NIRUBOOT_QMP=${NIRUBOOT_TEST_SPLASH:+$W/qmp} NIRUBOOT_SHOTS=$SHOTS-resume NIRUBOOT_RESUME_MARK=$(cat "$W/mark") \
+  python3 "$HERE/tests/serial-check.py" "$W/serial" "$PASS" "$ENCRYPT" "$FORM" "$DISTRO" | tee "$W/resume.log" || rc=$?
+fi
 kill "$(cat "$W/qemu.pid")" 2>/dev/null || :
 exit "$rc"

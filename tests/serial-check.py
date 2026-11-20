@@ -234,6 +234,36 @@ elif encrypt == "yes":
     read_any(["assphrase", "unlock disk"], 180)
     time.sleep(1)
     send(password + "\r")
+# Back from hibernation (NIRUBOOT_RESUME_MARK): no login, the old session is
+# restored; the mark written to RAM before must still be there.
+RESUME_MARK = os.environ.get("NIRUBOOT_RESUME_MARK")
+if RESUME_MARK:
+    time.sleep(3)
+    send("\r")
+    send("cat /dev/shm/ns-mark; echo RESUME\"\"-DONE\r")
+    seen = read_until("RESUME-DONE", 180)
+    if RESUME_MARK not in seen:
+        print("\nFAIL: the session did not come back from hibernation (no mark in RAM)")
+        raise SystemExit(1)
+    print("\n[sleep-test] resumed: the mark in RAM survived", flush=True)
+    send(f"echo '{password}' | sudo -S -p '' /tmp/nirusleep doctor; echo DOC\"\"-RC=$?\r")
+    doc = read_until("DOC-RC=", 120) + read_until("\n", 5)
+    send(f"sudo -S -p '' /tmp/nirusleep remove </dev/null >/tmp/ns-rm.log 2>&1; echo RM\"\"-RC=$?; "
+         "grep -c resume_offset /boot/grub/grub.cfg; swapon --show=NAME --noheadings | tr '\\n' ,; echo RM\"\"-END\r")
+    rm = read_until("RM-END", 900)
+    fails = []
+    if not doc.strip().endswith("0"):
+        fails.append("nirusleep doctor after resume")
+    if "RM-RC=0" not in rm:
+        fails.append("nirusleep remove failed")
+    if "nirusleep.swap" in rm:
+        fails.append("the swap file is still in use after remove")
+    send(f"echo '{password}' | sudo -S -p '' poweroff\r")
+    if fails:
+        print("\nFAIL:", "; ".join(fails))
+        raise SystemExit(1)
+    print(f"\nPASS: {distro} hibernate, resume and remove")
+    raise SystemExit(0)
 read_until("login:", 240)
 time.sleep(2)
 send("niru\r")
@@ -319,6 +349,79 @@ if not fails and len(sys.argv) > 6 and sys.argv[6] == "nirux":
         fails.append("nirux install failed (see the console log)")
     else:
         print("\nNIRUX installed:", tail.strip())
+# Hibernation (NIRUBOOT_TEST_SLEEP=FILE): copy nirusleep in over the serial
+# line, set it up, write a mark into RAM and hibernate. vm-test.sh starts the
+# machine again (exit code 3) and the next run checks the mark.
+SLEEP_FILE = os.environ.get("NIRUBOOT_TEST_SLEEP")
+if SLEEP_FILE and not fails:
+    import base64
+    data = base64.encodebytes(open(SLEEP_FILE, "rb").read()).decode()
+    send("stty -echo; base64 -d > /tmp/nirusleep <<'NSEOF'\r")
+    for line in data.splitlines():
+        send(line + "\r")
+        time.sleep(0.01)
+    send("NSEOF\r")
+    send("stty echo; chmod 755 /tmp/nirusleep; /tmp/nirusleep --version; echo PUSH\"\"-DONE\r")
+    read_until("PUSH-DONE", 120)
+    send(f"echo '{password}' | sudo -S -p '' true; sudo -S -p '' /tmp/nirusleep install --delay 1 </dev/null; echo NS\"\"-RC=$?\r")
+    rc = read_until("NS-RC=", 1800) + read_until("\n", 5)
+    if not rc.strip().endswith("0"):
+        send("sudo -S -p '' tail -30 /var/log/nirusleep.log </dev/null; echo LOG\"\"-END\r")
+        print(read_until("LOG-END", 30))
+        fails.append("nirusleep install failed")
+    else:
+        send("sudo -S -p '' /tmp/nirusleep doctor </dev/null; echo DOC\"\"-RC=$?\r")
+        doc = read_until("DOC-RC=", 300) + read_until("\n", 5)
+        if not doc.strip().endswith("0"):
+            fails.append("nirusleep doctor before hibernating")
+    if not fails:
+        mark = f"MARK-{int(time.time())}"
+        send(f"echo {mark} > /dev/shm/ns-mark; sync; echo HIB\"\"-GO\r")
+        read_until("HIB-GO", 30)
+        hib = "zzz -Z" if distro == "void" else "systemctl hibernate"
+        send(f"sudo -S -p '' {hib} </dev/null\r")
+        # The machine writes its memory and switches off: the line closes.
+        end = time.time() + 600
+        while time.time() < end:
+            try:
+                if not s.recv(4096):
+                    break
+            except socket.timeout:
+                pass
+            except OSError:
+                break
+        else:
+            print("\nFAIL: the machine did not switch off to hibernate")
+            raise SystemExit(1)
+        open(os.environ["NIRUBOOT_MARK_FILE"], "w").write(mark)
+        print("\n[sleep-test] hibernated; starting it again", flush=True)
+        raise SystemExit(3)
+    print("FAIL:", "; ".join(fails))
+    raise SystemExit(1)
+# The goodbye: start the shutdown splash the way the machine does when it
+# stops (systemd's plymouth-poweroff unit, or nirusplash's runit stage 3 file
+# on Void), see the banner and the status lines, and end it again. A real
+# poweroff in a VM is over before a screenshot can catch it.
+if QMP and not splash_fail:
+    if distro == "void":
+        start = "sudo -S -p '' sh -c '. /etc/runit/shutdown.d/15-nirusplash.sh' </dev/null"
+    else:
+        start = "sudo -S -p '' systemctl start plymouth-poweroff.service </dev/null"
+    send(f"echo '{password}' | sudo -S -p '' true; {start}; echo BYE\"\"-STARTED\r")
+    read_until("BYE-STARTED", 60)
+    bye, n = False, 0
+    end = time.time() + 20
+    while time.time() < end and not bye:
+        shot = grab(f"bye-{n:03d}")
+        n += 1
+        banner, band, _ = bands(shot)
+        bye = banner > 800 and band > 20
+        time.sleep(0.2)
+    send("sudo -S -p '' plymouth quit </dev/null; echo BYE\"\"-QUIT\r")
+    read_until("BYE-QUIT", 30)
+    print("[splash-test] goodbye splash:", "seen" if bye else "not seen", f"({n} screens)")
+    if not bye:
+        fails.append("no goodbye splash in shutdown mode")
 send(f"echo '{password}' | sudo -S -p '' poweroff\r")
 print()
 if fails:

@@ -23,9 +23,10 @@ want: `~/install-nirux` installs NIRUX with one command.
     and on laptops `@swap` with a swap file
   - `compress=zstd:1,noatime`, zram swap on every machine
   - optional LUKS2 encryption of the root, asked for (default yes on laptops)
-- **System:** kernel, firmware, CPU microcode and graphics drivers for the
-  hardware it finds (Intel, AMD), GRUB, NetworkManager, sudo, SSH, time sync,
-  git and curl.
+- **System:** kernel, firmware (with the sound firmware Intel laptops need
+  for their speakers and microphones), CPU microcode and graphics drivers for
+  the hardware it finds (Intel, AMD), GRUB, NetworkManager, sudo, SSH, time
+  sync, git and curl.
 - **Settings:** English (`en_US.UTF-8`), Swedish keyboard on the console, in
   X and when you type the disk password, Europe/Stockholm time.
 - **User:** `niru` with sudo (group wheel); root is locked.
